@@ -115,8 +115,8 @@ def test_mfma_a8_flyc_preshuffle(
         # operator's operand!"), while CDNA4 (gfx950) handles it. Restrict async
         # copy to gfx950 until the gfx942 codegen path is supported.
         pytest.skip(f"async copy (buffer_load_lds) is only supported on gfx950, not {get_rocm_arch()}")
-    if use_async_copy and in_dtype not in ("fp8", "int8"):
-        pytest.skip("async copy (buffer_load_lds) only supports 8-bit inputs (fp8/int8)")
+    # if use_async_copy and in_dtype not in ("fp8", "int8"):
+    #     pytest.skip("async copy (buffer_load_lds) only supports 8-bit inputs (fp8/int8)")
     print("=" * 80)
     print(f"[flyc] MFMA {in_dtype.upper()} GEMM Test (Tile: {tile_m}x{tile_n}x{tile_k})")
     print("=" * 80)

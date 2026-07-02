@@ -13,6 +13,7 @@ from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, 
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+USE_SWIZZLE = False
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k); ported from v1.
 _TILE_PRELOAD_TABLE = {
     # (tile_m, tile_n, tile_k): (dsrd_preload, dvmem_preload)
@@ -144,8 +145,8 @@ def compile_preshuffle_gemm(
     elem_bytes = 1 if is_8bit else 2
 
     # The async gmem->LDS DMA (buffer_load_lds 128b) only lowers for 8-bit inputs.
-    if use_async_copy and not is_8bit:
-        raise ValueError("use_async_copy is only supported for 8-bit inputs (fp8/int8)")
+    # if use_async_copy and not is_8bit:
+    #     raise ValueError("use_async_copy is only supported for 8-bit inputs (fp8/int8)")
 
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
@@ -252,21 +253,22 @@ def compile_preshuffle_gemm(
                     "expected tile_k*elem_bytes to be a positive multiple of 16 with (tile_k*elem_bytes/16) a power of two."
                 )
             swz_bits = k_blocks16.bit_length() - 1  # log2
+            print(f'#####\n{swz_bits=}')
             swz = fx.SwizzleType.get(swz_bits, 4, swz_bits)
         else:
             swz = fx.SwizzleType.get(3, 3, 3)
 
+        swizzle_layout = fx.make_ordered_layout((tile_m, tile_k), (1, 0))
+        if USE_SWIZZLE:
+            swizzle_layout = fx.make_composed_layout(
+                fx.static(swz),
+                fx.make_ordered_layout((tile_m, tile_k), (1, 0)),)
         def _make_sA(arr):
             return fx.make_view(
                 arr.ptr,
-                fx.make_composed_layout(
-                    fx.static(swz),
-                    fx.make_ordered_layout((tile_m, tile_k), (1, 0)),
-                ),
-            )
-
+                swizzle_layout
+    )
         sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1)]
-
         # Partitions
         pA_g = thr_g2s.partition_S(tA)
         pA_s_stages = [thr_g2s.partition_D(s) for s in sA_stages]
@@ -301,7 +303,9 @@ def compile_preshuffle_gemm(
             sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr), fx.recast_iter(Int8, lds.a1.ptr)]
             bx_m = bid_x * tile_m
             wave_id = tid // 64
+            # 256*16. 256 threads load contineously
             step_bytes = total_threads * a_load_bytes
+            # each wave load 64*16 btyes.
             wave_stride_bytes = 64 * a_load_bytes
             k_blocks16_dma = (tile_k * elem_bytes) // 16
             elems_per_16b = 16 // elem_bytes
@@ -317,7 +321,11 @@ def compile_preshuffle_gemm(
                     elem_idx = pos_bytes // elem_bytes
                     m = elem_idx // tile_k
                     k = elem_idx % tile_k
-                    k_swz = k ^ ((m % k_blocks16_dma) * elems_per_16b)
+                    k_swz = k
+                    if USE_SWIZZLE:
+                        k_swz = k ^ ((m % k_blocks16_dma) * elems_per_16b)
+                        # k_swz = ((k // elems_per_16b) ^ (m % k_blocks16_dma)) * elems_per_16b
+                    print(f'###############################################')
                     gmem_byte = ((bx_m + m) * K + base_k + k_swz) * elem_bytes
                     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                     src = fx.slice(gA_div, (None, fx.Int32(gmem_byte)))

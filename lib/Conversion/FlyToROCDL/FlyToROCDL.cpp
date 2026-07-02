@@ -541,7 +541,11 @@ public:
 
     if (!srcMemTy || !dstMemTy)
       return rewriter.notifyMatchFailure(op, "expected MemRef types on original op");
-    if (srcMemTy.getElemTy() != dstMemTy.getElemTy())
+    
+    // buffer_copy_lds allows type mismatch (e.g., bf16 -> i8) for byte-level transfers.
+    // For other copy atoms, require matching element types.
+    bool isBufferCopyLDS = isa<CopyOpCDNA3BufferCopyLDSType>(copyAtom.getCopyOp());
+    if (!isBufferCopyLDS && srcMemTy.getElemTy() != dstMemTy.getElemTy())
       return rewriter.notifyMatchFailure(op, "src/dst element types mismatch");
 
     Location loc = op.getLoc();

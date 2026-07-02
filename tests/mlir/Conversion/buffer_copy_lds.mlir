@@ -138,3 +138,17 @@ func.func @test_buffer_copy_lds_const_both(
   fly.copy_atom_call(%a2, %src, %dst) : (!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<32>, 32>, !fly.memref<f32, #fly_rocdl.buffer_desc, 1:1>, !fly.memref<f32, shared, 1:1>) -> ()
   return
 }
+
+// -----
+
+// bf16 (16-bit) -> i8 (shared) copy: allows type mismatch for byte-level transfers
+
+// CHECK-LABEL: @test_buffer_copy_lds_bf16_to_i8
+func.func @test_buffer_copy_lds_bf16_to_i8(
+    %src: !fly.memref<bf16, #fly_rocdl.buffer_desc, 1:1>,
+    %dst: !fly.memref<i8, shared, 1:1>) {
+  %atom = fly.make_copy_atom {valBits = 128 : i32} : !fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<128>, 128>
+  // CHECK: rocdl.raw.ptr.buffer.load.lds
+  fly.copy_atom_call(%atom, %src, %dst) : (!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<128>, 128>, !fly.memref<bf16, #fly_rocdl.buffer_desc, 1:1>, !fly.memref<i8, shared, 1:1>) -> ()
+  return
+}
