@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl, vector
-NUM_CU = 1
+NUM_CU = 256
 N_ITER = 4
 M_REPEAT = 4
 WAVE_NUM=4
@@ -34,7 +34,7 @@ def enable_dump_ir(enable_debug_info=True):
         os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 
-LDS_SWIZZLE=False
+LDS_SWIZZLE=True
 
 @fx.struct
 class SharedStorage:
@@ -107,15 +107,14 @@ def async_copy_kernel(
     lds = fx.SharedAllocator().allocate(SharedStorage).peek()   
     LDS_layout_A =fx.make_ordered_layout((M_BLOCK, N_BLOCK), (1, 0))
 
-    # if LDS_SWIZZLE:
-    #     LDS_layout_A = fx.make_composed_layout(
-    #         fx.static(fx.SwizzleType.get(3, 3, 3)),
-    #         fx.make_ordered_layout((M_BLOCK, N_BLOCK), (1, 0)),
-    #     )
+    if LDS_SWIZZLE:
+        LDS_layout_A = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(3, 3, 3)),
+            fx.make_ordered_layout((M_BLOCK, N_BLOCK), (1, 0)),
+        )
     sA = fx.make_view(lds.a0.ptr, LDS_layout_A)
     bB = fx.flat_divide(B, (M_BLOCK, N_BLOCK))
     bB = bB[None, None, bid, None]
-
 
     copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
     uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
@@ -141,39 +140,36 @@ def async_copy_kernel(
 
     gA_div = fx.logical_divide(gA_flat, fx.make_layout(1, 1))
     print(f'#####{gA_div=}\n{gA_flat=}')
-    sA_i8_ptr = fx.recast_iter(Int8, lds.a0.ptr)
     sA_ptr = lds.a0.ptr
 
 
     bx_m = bid * M_BLOCK
     wave_id = tid // 64
     # 256*8. 256 threads load contineously
-    load_bytes = 16
+    load_elems = 16 // elem_bytes
     # each wave load 64*16 btyes.
-    wave_stride_bytes = 64 * load_bytes
+    wave_stride = 64 * load_elems
     # num_a_loads = M_BLOCK // (WAVE_NUM*8)
     def dma_a_to_lds(blk_idx):
-        wave_off = fx.rocdl.readfirstlane(fx.Int32.ir_type, wave_id * wave_stride_bytes)
-        lds_ptr = fx.add_offset(sA_i8_ptr, wave_off)
-        # lds_ptr = fx.add_offset(sA_ptr, wave_off//2)
+        wave_off = fx.rocdl.readfirstlane(fx.Int32.ir_type, wave_id * wave_stride)
+        lds_ptr = fx.add_offset(sA_ptr, wave_off)
         base_n = blk_idx * N_BLOCK
         total_threads = WAVE_NUM * 64
-        step_bytes = total_threads * load_bytes
+        step_elems = total_threads * load_elems
         for i in range_constexpr(M_REPEAT):
-            pos_bytes =  i * total_threads * load_bytes + tid * load_bytes
-            elem_idx = pos_bytes // elem_bytes
-            m = elem_idx // N_BLOCK
-            n = elem_idx % N_BLOCK
+            elem_pos =  i * total_threads * load_elems + tid * load_elems
+            m = elem_pos // N_BLOCK
+            n = elem_pos % N_BLOCK
             n_swz = n
-            # if LDS_SWIZZLE:
+            if LDS_SWIZZLE:
                 # n_swz = n ^ ((m % k_blocks16_dma) * elems_per_16b)
-                # k_swz = ((k // elems_per_16b) ^ (m % k_blocks16_dma)) * elems_per_16b
+                n_swz = ((n // 8) ^ (m % 8)) * 8
             # print(f'###############################################')
-            offset = (m * N + base_n + n_swz)
+            offset = ((bx_m + m) * N + base_n + n_swz)
             dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
             src = fx.slice(gA_div, (None, fx.Int32(offset)))
             fx.copy(dma_atom, src, dst)
-            lds_ptr = fx.add_offset(lds_ptr, step_bytes)
+            lds_ptr = fx.add_offset(lds_ptr, step_elems)
 
     for block_idx in range(0, N_ITER):
         dma_a_to_lds(block_idx)
