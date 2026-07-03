@@ -253,10 +253,12 @@ def compile_preshuffle_gemm(
                     "expected tile_k*elem_bytes to be a positive multiple of 16 with (tile_k*elem_bytes/16) a power of two."
                 )
             swz_bits = k_blocks16.bit_length() - 1  # log2
-            print(f'#####\n{swz_bits=}')
             swz = fx.SwizzleType.get(swz_bits, 4, swz_bits)
         else:
-            swz = fx.SwizzleType.get(3, 3, 3)
+            k_blocks16 = (tile_k * elem_bytes) // 16
+            swz_bits = k_blocks16.bit_length() - 1  # log2
+            print(f'##{swz_bits=} .... {k_blocks16=}')
+            swz = fx.SwizzleType.get(swz_bits, 3, swz_bits)
 
         swizzle_layout = fx.make_ordered_layout((tile_m, tile_k), (1, 0))
         if USE_SWIZZLE:
@@ -299,6 +301,8 @@ def compile_preshuffle_gemm(
                 max_size=False,
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
             )
+            print(f'#####\n{gA_flat=}\n{arg_a=}')
+
             gA_div = fx.logical_divide(gA_flat, fx.make_layout(1, 1))
             sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr), fx.recast_iter(Int8, lds.a1.ptr)]
             bx_m = bid_x * tile_m
@@ -323,10 +327,15 @@ def compile_preshuffle_gemm(
                     k = elem_idx % tile_k
                     k_swz = k
                     if USE_SWIZZLE:
-                        k_swz = k ^ ((m % k_blocks16_dma) * elems_per_16b)
-                        # k_swz = ((k // elems_per_16b) ^ (m % k_blocks16_dma)) * elems_per_16b
-                    print(f'###############################################')
-                    gmem_byte = ((bx_m + m) * K + base_k + k_swz) * elem_bytes
+                        if const_expr(is_8bit):
+                            k_swz = k ^ ((m % k_blocks16_dma) * elems_per_16b)
+                            # k_swz = ((k // elems_per_16b) ^ (m % k_blocks16_dma)) * elems_per_16b
+                        else:
+                            k_swz = k ^ ((m % k_blocks16_dma) * elems_per_16b)
+                            # k_swz = ((k // 8) ^ (m % 16)) * 8
+
+                    # print(f'###############################################')
+                    gmem_byte = ((bx_m + m) * K + base_k + k_swz)
                     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                     src = fx.slice(gA_div, (None, fx.Int32(gmem_byte)))
                     fx.copy(dma_atom, src, dst)
