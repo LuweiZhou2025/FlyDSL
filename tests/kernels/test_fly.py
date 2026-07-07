@@ -41,7 +41,7 @@ def enable_dump_ir(enable_debug_info=True):
         os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 
-LDS_SWIZZLE = _env_flag("SWIZZLE", "1")
+LDS_SWIZZLE = _env_flag("SWIZZLE", "0")
 
 @fx.struct
 class SharedStorage:
@@ -76,6 +76,15 @@ def asycn_copy_tile(
     uni_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
     async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
 
+    tiled_mma = fx.make_tiled_mma(
+    fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float16)),
+    fx.make_layout((2, 2, 1), (2, 1, 0)),
+    fx.make_tile(None, None, fx.make_layout((8, 4, 2), (1, 8, 32))),)
+
+    thr_copy_mma = fx.make_tiled_copy_A(copy_atom, tiled_mma).get_slice(tid)
+    thr_mma = tiled_mma.thr_slice(tid)
+
+
     lds = fx.SharedAllocator().allocate(SharedStorage).peek()   
     LDS_layout_A =fx.make_ordered_layout((M_BLOCK, N_BLOCK), (1, 0))
     sA_wr = fx.make_view(fx.get_dyn_shared(fx.BFloat16), LDS_layout_A)
@@ -84,8 +93,9 @@ def asycn_copy_tile(
     # partition the tensor into tiles for each thread
     g2s_src = dma_thr_copy.partition_S(bA)
     g2s_dest = dma_thr_copy.partition_D(sA_wr)
-    s2g_src = lds_thr_copy.partition_S(sA_rd)
-    s2g_dst = lds_thr_copy.partition_D(bB)
+
+    s2g_src = thr_copy_mma.partition_S(sA_rd)
+    s2g_dst = thr_copy_mma.partition_D(bB)
     # if using swizzle, apply the swizzle in the buffer_load_lds src address and LDS read src
     # only needs to update the g2s_src and s2g_src
     if LDS_SWIZZLE:
@@ -101,7 +111,7 @@ def asycn_copy_tile(
                 LDS_layout_A,
             )
         sA_rd = fx.make_view(fx.get_iter(sA_wr), SWIZZLE_LDS_layout_A)
-        s2g_src = lds_thr_copy.partition_S(sA_rd)
+        s2g_src = thr_copy_mma.partition_S(sA_rd)
         num_shift = N.bit_length() - 1 - num_base 
         # num_shift = log 2 (stride of m) - num_base
         GA_SWIZZLE_LAYOUT = fx.make_composed_layout(
@@ -113,8 +123,8 @@ def asycn_copy_tile(
         bA_swizzle = bA_swizzle[None, None, bid, None]
         g2s_src = dma_thr_copy.partition_S(bA_swizzle)
 
-    s2g_frag = fx.make_fragment_like(s2g_src)
-
+    mma_frag = thr_mma.make_fragment_A(sA_rd)
+    s2g_frag = thr_copy_mma.retile(mma_frag)
     for block_idx in range(0, N_ITER):
         fx.copy(async_copy_atom, g2s_src[None, None, None, block_idx], g2s_dest)
         gpu.barrier()
