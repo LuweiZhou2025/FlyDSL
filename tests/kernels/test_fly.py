@@ -9,8 +9,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl, vector
-NUM_CU = 8
-N_ITER = 16
+NUM_CU = 1
+N_ITER = 2
 M_REPEAT = 4
 WAVE_NUM=4
 M_BLOCK = WAVE_NUM * 8 * M_REPEAT
@@ -47,6 +47,7 @@ LDS_SWIZZLE = _env_flag("SWIZZLE", "0")
 class SharedStorage:
     a0: fx.Array[BFloat16, M_BLOCK*N_BLOCK, 16]
 
+    
 @flyc.kernel
 def asycn_copy_tile(
     A: fx.Tensor,
@@ -73,7 +74,7 @@ def asycn_copy_tile(
     dma_thr_copy = dma_tiled_copy.get_slice(tid)
     lds_thr_copy = dma_thr_copy
 
-    uni_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+    lsd_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
     async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
 
     tiled_mma = fx.make_tiled_mma(
@@ -128,7 +129,7 @@ def asycn_copy_tile(
     for block_idx in range(0, N_ITER):
         fx.copy(async_copy_atom, g2s_src[None, None, None, block_idx], g2s_dest)
         gpu.barrier()
-        fx.copy(uni_copy_128b_atom, s2g_src, s2g_frag)
+        fx.copy(lsd_copy_128b_atom, s2g_src, s2g_frag)
         fx.copy(copy_atom, s2g_frag, s2g_dst[None, None, None, block_idx])
 
 
@@ -154,7 +155,7 @@ def async_copy_isa(
     bB = bB[None, None, bid, None]
 
     copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-    uni_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+    lsd_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
     thr_layout = fx.make_layout((WAVE_NUM*8 , 8), (8, 1))
     val_layout = fx.make_layout((1, 8), (1, 1))
 
@@ -210,9 +211,116 @@ def async_copy_isa(
         dma_a_to_lds(block_idx)
         # rocdl.s_waitcnt(0)
         gpu.barrier()
-        fx.copy(uni_copy_128b_atom, s2g_src, s2g_frag)
+        fx.copy(lsd_copy_128b_atom, s2g_src, s2g_frag)
         fx.copy(copy_atom, s2g_frag, s2g_dst[None, None, None, block_idx])
- 
+
+
+PADDING_ELEMS = 16
+PADDING_NUM = PADDING_ELEMS * 16
+
+@fx.struct
+class LDS_PADDING:
+    a0: fx.Array[BFloat16, M_BLOCK*N_BLOCK+PADDING_NUM, 16]
+@flyc.kernel
+def asycn_copy_padding(
+    A: fx.Tensor,
+    B: fx.Tensor,
+):
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+
+    A = fx.rocdl.make_buffer_tensor(A)
+    B = fx.rocdl.make_buffer_tensor(B)
+
+    buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+    async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+    lsd_copy_128b_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+
+    #async copy使用的是 8x8 thread layout copy数据, 每一行的8个列线程去实际Atensor中一行的BK个连续元素，
+    #8个thread 行这里不会去读取A中BM连续的8行， paddding的copy中会将BM分成8组，每一组中包含连续的BM//8行数据，每一个组对应的是8x8 thread 访问的一行，
+    #所以每个组内部的行数BM //8, 会被不同wave相同的 行thread 访问，BM //8 // WAVE_NUM 就是每个thread的buffer load LDS 指令个数
+    #对应的8个thread 行会从对应的8个组中读取数据，所以这个的一个copy tile在实际的读取A tensor中是个sparse的布局，如何实现？？
+    
+    #fx.make_tiled_copy（暂时先把copy atom放在一边）代表的是一个workgroup 中所有的thread访问src和dest是 thread 与 logical m, logical n之间的关系，
+    #logical m/n都是连续的，所以make tiled copy代表的是一个逻辑m,n上dense的 tile. tile大小用(tile_m, tile_n) 表达, 每个thread访问的logical_m, logical_n 通过value计算
+    #thread_id -> 1D value(M major/column major) -> 2D index (logic m, logic n), logical_m = value % tile_m, logial_n = value // tile_m
+    #所以tiled_copy就是一个逻辑上dense的块，与实际的内存布局可以解耦， 每一列的stride就是tile_m, 所以如果source和destination的线程的layout一致(比如都是8x8 coalescing的方式)
+    #source和destination就可以使用同一个tiled_copy. 至于实际的内存布局，可以通过把tensor view成不同的layout(通常是把m/n, mode 拆分, mode的序列重新排布)， 把tiled_copy中
+    #logiccal_m, logical_n对应的 实际m, n中的submode排在m, n sublayout的前面。
+    
+    # 这里我们先只看async_copy 读m维度：
+    # A的 nature layout 是 （M，N）: (N, 1), 这里对m mode做一下拆解 , 对于每个sublayout, mode0是变化最快的。
+    #（M_BLOCK, M//M_BLOCK）, N : (N, N * （M_BLOCK), 1, 关系继续拆解M_BLOCK, M_BLOCK 分成8组
+    # (M_BLOCK//8 , 8 , M // M_BLOCK), N : (N, N * M_BLOCK//8, N * MBLOCK, 1)
+    # 这里对于tile_copy的logical m, 8 是8个thread row访问的维度，所以在tiled_copy生成pdf文件中，8 是在logical m 里面的变化最快维度，所以我们这里需要把layout 转一下转化，
+    # 目的试tensor A 实际的 m sublayout的被分解后的mode 排序与 tiled copy中逻辑m的mode 排序一致， logical m是按照(8 thread rows, WAVE_NUM) 排布，
+    # 所以这里我们需要把m 里面的mode0 与 mode1交换一下，重新生成一个A tensor view.
+    # (8 ,            M_BLOCK//8 , M // M_BLOCK), N : 
+    # (N * M_BLOCK//8, N,  N * MBLOCK), 1
+    # 这样就可以用这个copy tiled 去partition A tensor了。
+    
+    # wave0的thread0在tiled_copy中访问8行，实际的tensor layout对应m0, m16, m32, m48, m64, m80, m96, m112.
+    ac_tile_mn = fx.make_tile(WAVE_NUM*8, 64)
+    ac_tv_layout =  fx.make_layout(((8, 8, WAVE_NUM), 8), ((8*WAVE_NUM*8, 1, 8), WAVE_NUM*8))
+    ac_tiled_copy = fx.make_tiled_copy(buffer_copy_atom, ac_tv_layout, ac_tile_mn)
+    ac_thr = ac_tiled_copy.get_slice(tid)
+    A = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout(((8, M_BLOCK//8, M//M_BLOCK), N), ((M_BLOCK//8*N, N, M_BLOCK*N), 1))))
+    
+    # slicing A, B tensor
+    bA = fx.flat_divide(A, (M_BLOCK, N_BLOCK))
+    bB = fx.flat_divide(B, (M_BLOCK, N_BLOCK))
+    bA = bA[None, None, bid, None]
+    bB = bB[None, None, bid, None]
+    
+    # buffer load写入LDS的layout是自然的layout,
+    # 没有padding的情况下，LDS的layout是 (M_BLOCK, N_BLOCK) : (N_BLOCK, 1), M_BLOCK这里是128
+    # 拆解成 ((8, 16), N_BLOCK) : ((N_BLOCK, N_BLOCK*8), 1), 然后考虑padding,每8行之后做一个Padding,所以只需要把padding的stride加到`16`这个mode上
+    lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()   
+    lds_layout_wr =fx.make_layout(((8, 16), N_BLOCK), ((N_BLOCK, 8*N_BLOCK+PADDING_ELEMS), 1))
+    
+    #LDS的读取使用的是16x4 thread copy_tiled, 模拟MFMA读取pattern, 4个wave在M维度平铺的方式。
+    # LDS 读取的tiled_copy与写入B的tiled_copy 一致，
+    # 同样需要考虑LDS的读取layout 
+    # LDS自然的layout是 ((8, 16), N_BLOCK), ((N_BLOCK, 8*N_BLOCK+PADDING_ELEMS), 1)， N block拆解成32x2:
+    # ((8, 16), (32, N_BLOCK//2), ((N_BLOCK, 8*N_BLOCK+PADDING_ELEMS), (1, 32))
+    # read LDS tiled copy 中 logical_m，按照（16， WAVE_NUM）排布，所以把16 放在mode0, sA_rd的layout就是：
+    # ((16,  M_BLOCK//16),                     (32, N_BLOCK//32))：
+    # ((M_BLOCK//16*N_BLOCK+PADDING_ELEMS, 64), (1, 32))
+    
+    # 4个WAVE的 thread0-thread3会读4LDS中的连续4行，所以这里就不用在M_BLOCK//16里把4再拆分出来了，如果想要拆分也可以，就是
+    # ((16,                               4， M_BLOCK//64),  (32, N_BLOCK//32))：
+     # ((M_BLOCK//16*N_BLOCK+PADDING_ELEMS, 64， 64*4), (1, 32))
+    # each wave use 16 * 4 MFMA threads layout
+    lds_rd_tile_mn = fx.make_tile(WAVE_NUM*16, 32)
+    lds_rd_tv_layout =  fx.make_layout(((16, 4, WAVE_NUM), 8), ((1, 16*WAVE_NUM*8, 16), WAVE_NUM*16))
+    lds_rd_tiled = fx.make_tiled_copy(buffer_copy_atom, lds_rd_tv_layout, lds_rd_tile_mn)
+    lds_rd_thread = lds_rd_tiled.get_slice(tid)
+    # fx.utils.print_typst(lds_rd_tiled, file="lds_rd_tiled.typ")
+    sA_wr = fx.make_view(lds.a0.ptr, lds_layout_wr)
+    
+    # padding LDS read layout:
+    lds_layout_rd =fx.make_layout(((16, M_BLOCK//16), (32, N_BLOCK//32)), ((M_BLOCK//16*N_BLOCK+PADDING_ELEMS, 64), (1, 32)))
+    # lds_layout_rd =fx.make_layout(((16, 4, M_BLOCK//64), (32, N_BLOCK//32)), ((M_BLOCK//16*N_BLOCK+PADDING_ELEMS, 64, 256), (1, 32)))
+
+    sA_rd = fx.make_view(lds.a0.ptr, lds_layout_rd)
+    ac_src = ac_thr.partition_S(bA)
+    ac_dest = ac_thr.partition_D(sA_wr)
+    
+    s2g_src = lds_rd_thread.partition_S(sA_rd)
+    # B的自然layout与LDS 读取的mode一致，不需要改变。
+    s2g_dest = lds_rd_thread.partition_D(bB)
+    s2g_frag = fx.make_fragment_like(s2g_dest[None, None, None, 0])
+    
+    test_s2g_src = ac_thr.partition_S(sA_rd)
+    test_dest = ac_thr.partition_D(bB)
+    test_frag = fx.make_fragment_like(test_dest[None, None, None, 0])
+    for block_idx in range(0, N_ITER):
+        fx.copy(async_copy_atom, ac_src[None, None, None, block_idx], ac_dest)
+        gpu.barrier()
+        fx.copy(lsd_copy_128b_atom, s2g_src, s2g_frag)
+        fx.copy(buffer_copy_atom, s2g_frag, s2g_dest[None, None, None, block_idx])
+
+
 
 @flyc.jit
 def async_dma_copy(
@@ -220,24 +328,24 @@ def async_dma_copy(
     B: fx.Tensor,
     stream: fx.Stream = fx.Stream(None),
 ):
-    M_max = 65536
-    arg_a_2d = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M_max, N), (N, 1))))
-    asycn_copy_tile(arg_a_2d, B).launch(grid=(NUM_CU, 1, 1), block=(WAVE_NUM*64, 1, 1), smem=M_BLOCK*N_BLOCK*2, stream=stream)
+    arg_a_2d = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M, N), (N, 1))))
+    asycn_copy_padding(arg_a_2d, B).launch(grid=(NUM_CU, 1, 1), block=(WAVE_NUM*64, 1, 1), smem=M_BLOCK*N_BLOCK*2, stream=stream)
 
 
 enable_dump_ir(False)
 A = torch.arange(M * N, dtype=torch.bfloat16).reshape(M, N).cuda()
 B = torch.zeros(M, N, dtype=torch.bfloat16).cuda()
-
+LDS_RESULT = A.clone().reshape(M//M_BLOCK, 8, M_BLOCK//8, N).permute(0, 2, 1, 3).contiguous().reshape(M, N)
+print(f'{M=} {N=} {M_BLOCK=} {N_BLOCK=} {WAVE_NUM=}')
 async_dma_copy(A, B, stream=torch.cuda.Stream())
 torch.cuda.synchronize()
 
 
-# print(A[0])
-# print(B[0])
-
 is_correct = torch.allclose(A, B)
 print("Result correct:", is_correct)
-if not is_correct:
-    print("A:", A)
-    print("B:", B)
+# if not is_correct:
+    # print(f'{A[0]=}')
+    # print(f'{B[0]=}')
+    # print(f'{A[1]=}')
+    # print(f'{B[1]=}')
+    # print(f'{B[2]=}')
