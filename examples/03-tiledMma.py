@@ -24,13 +24,13 @@ def gemm_kernel(
     B = fx.rocdl.make_buffer_tensor(B)
     C = fx.rocdl.make_buffer_tensor(C)
 
-    bA = fx.zipped_divide(A, (block_m, block_k))
-    bB = fx.zipped_divide(B, (block_n, block_k))
+    bA = fx.zipped_divide(A, (block_m, block_k)) 
+    bB = fx.zipped_divide(B, (block_n, block_k)) 
     bC = fx.zipped_divide(C, (block_m, block_n))
 
-    bA = fx.slice(bA, (None, bid))
-    bB = fx.slice(bB, (None, bid))
-    bC = fx.slice(bC, (None, bid))
+    bA = fx.slice(bA, (None, bid))# (BM, BK, k)
+    bB = fx.slice(bB, (None, bid))# (BN, BK, k)
+    bC = fx.slice(bC, (None, bid))# (BM, BN
 
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
     tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 2, 0)))
@@ -38,12 +38,17 @@ def gemm_kernel(
 
     copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
     
-    copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
     
 
     tiled_copy_A = fx.make_tiled_copy_A(copy_atom, tiled_mma)
     tiled_copy_B = fx.make_tiled_copy_B(copy_atom, tiled_mma)
-    tiled_copy_C = fx.make_tiled_copy_C(copy_atom_f32, tiled_mma)
+    # tiled_copy_C = fx.make_tiled_copy_C(copy_atom_f32, tiled_mma)
+    
+    c_tile_mn = fx.make_tile(16, 16)
+    c_tv_layout =  fx.make_layout(((16, 4), 4), ((1, 64) , 16))    
+    tiled_copy_C = fx.make_tiled_copy(copy_atom_f32, c_tv_layout, c_tile_mn)
+    
     print(f'{tiled_copy_A=}')
     print(f'{tiled_copy_B=}')
     print(f'{tiled_copy_C=}')
@@ -64,11 +69,12 @@ def gemm_kernel(
     copy_frag_B = thr_copy_B.retile(frag_B)
     copy_frag_C = thr_copy_C.retile(frag_C)
 
+    print(f"{copy_src_A=}")
     fx.copy(copy_atom, copy_src_A, copy_frag_A, pred=None)
     fx.copy(copy_atom, copy_src_B, copy_frag_B, pred=None)
 
     frag_C.fill(0)
-    fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
+    fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
 
     fx.copy(copy_atom_f32, copy_frag_C, copy_dst_C, pred=None)
 
