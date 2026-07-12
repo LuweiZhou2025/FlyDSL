@@ -6,9 +6,9 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-block_m = 64
-block_n = 64
-block_k = 8
+block_m = 16
+block_n = 16
+block_k = 32
 
 
 @flyc.kernel
@@ -32,14 +32,21 @@ def gemm_kernel(
     bB = fx.slice(bB, (None, bid))
     bC = fx.slice(bC, (None, bid))
 
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
-    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)))
+    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 2, 0)))
     thr_mma = tiled_mma.thr_slice(tid)
 
-    copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+    
+    copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    
+
     tiled_copy_A = fx.make_tiled_copy_A(copy_atom, tiled_mma)
     tiled_copy_B = fx.make_tiled_copy_B(copy_atom, tiled_mma)
-    tiled_copy_C = fx.make_tiled_copy_C(copy_atom, tiled_mma)
+    tiled_copy_C = fx.make_tiled_copy_C(copy_atom_f32, tiled_mma)
+    print(f'{tiled_copy_A=}')
+    print(f'{tiled_copy_B=}')
+    print(f'{tiled_copy_C=}')
 
     thr_copy_A = tiled_copy_A.get_slice(tid)
     thr_copy_B = tiled_copy_B.get_slice(tid)
@@ -63,7 +70,7 @@ def gemm_kernel(
     frag_C.fill(0)
     fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
 
-    fx.copy(copy_atom, copy_frag_C, copy_dst_C, pred=None)
+    fx.copy(copy_atom_f32, copy_frag_C, copy_dst_C, pred=None)
 
 
 @flyc.jit
@@ -73,19 +80,19 @@ def tiledMma(
     C: fx.Tensor,
     stream: fx.Stream = fx.Stream(None),
 ):
-    gemm_kernel(A, B, C).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
+    gemm_kernel(A, B, C).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 M, N, K = block_m, block_n, block_k
-A = torch.randn(M, K, dtype=torch.float32).cuda()
-B = torch.randn(N, K, dtype=torch.float32).cuda()
+A = torch.randn(M, K, dtype=torch.bfloat16).cuda()
+B = torch.randn(N, K, dtype=torch.bfloat16).cuda()
 C = torch.zeros(M, N, dtype=torch.float32).cuda()
 
 tiledMma(A, B, C, stream=torch.cuda.Stream())
 
 torch.cuda.synchronize()
 
-expected = A @ B.T
+expected = A.to(torch.float32) @ B.to(torch.float32).T
 is_correct = torch.allclose(C, expected, atol=1e-5, rtol=1e-5)
 print("Result correct:", is_correct)
 if not is_correct:
