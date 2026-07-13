@@ -2,14 +2,23 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import torch
-
+import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import flydsl.compiler as flyc
+from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
 
-block_m = 16
-block_n = 16
-block_k = 32
+m_tiles = 4
+n_tiles = 2
+block_m = 32*m_tiles
+block_n = 32*n_tiles
+block_k = 64
+M = block_m *16
+N = block_n*16
+K = block_k
 
+MFMA_BAC=True
 
 @flyc.kernel
 def gemm_kernel(
@@ -18,65 +27,90 @@ def gemm_kernel(
     C: fx.Tensor,
 ):
     tid = fx.thread_idx.x
-    bid = fx.block_idx.x
+    bid_x, bid_y, _ = fx.block_idx
 
     A = fx.rocdl.make_buffer_tensor(A)
     B = fx.rocdl.make_buffer_tensor(B)
     C = fx.rocdl.make_buffer_tensor(C)
 
-    bA = fx.zipped_divide(A, (block_m, block_k)) 
-    bB = fx.zipped_divide(B, (block_n, block_k)) 
-    bC = fx.zipped_divide(C, (block_m, block_n))
 
-    bA = fx.slice(bA, (None, bid))# (BM, BK, k)
-    bB = fx.slice(bB, (None, bid))# (BN, BK, k)
-    bC = fx.slice(bC, (None, bid))# (BM, BN
-
+    bA = fx.flat_divide(A, (block_m, block_k))[None, None, bid_x, None]  # (BM, BK, k)
+    # !fly.memref<f16, #fly_rocdl.buffer_desc, ((16,8),(8,8),64):((8,65536),(1,128),1024)>)>
+    # gb_k [bN, bK, k_iter], preshuffle B tensor is (16, N // 16), (8, 4, K // 32))
+    bB = fx.flat_divide(B, (block_n, block_k))[None, None, bid_y, None]  # (BN, BK, k)
+    bC = fx.flat_divide(C, (block_m, block_n))[None, None, bid_x, bid_y]  # (BM, BN)
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
-    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 2, 0)))
+    #tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (2, 1, 0)))
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)))
+
     thr_mma = tiled_mma.thr_slice(tid)
 
-    copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-    
-    copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
-    
+    copy_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+    copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    if const_expr(MFMA_BAC):
+        copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
-    tiled_copy_A = fx.make_tiled_copy_A(copy_atom, tiled_mma)
-    tiled_copy_B = fx.make_tiled_copy_B(copy_atom, tiled_mma)
-    # tiled_copy_C = fx.make_tiled_copy_C(copy_atom_f32, tiled_mma)
+    tiled_copy_A = fx.make_tiled_copy_A(copy_atom_bf16, tiled_mma)
+    tiled_copy_B = fx.make_tiled_copy_B(copy_atom_bf16, tiled_mma)
+    # fx.utils.print_typst(tiled_copy_A, file="tiled_copy_A.typ")
+    tiled_copy_C = fx.make_tiled_copy_C(copy_atom_f32, tiled_mma)
     
-    c_tile_mn = fx.make_tile(16, 16)
-    c_tv_layout =  fx.make_layout(((16, 4), 4), ((1, 64) , 16))    
-    tiled_copy_C = fx.make_tiled_copy(copy_atom_f32, c_tv_layout, c_tile_mn)
+    if const_expr(MFMA_BAC):
+        # C tile is B * A not A *B
+        c_tile_mn = fx.make_tile(32, 32)
+        #fx.make_layout((2, 2, 1), (2, 1, 0))
+        # c_tv_layout =  fx.make_layout((((16, 4), 2, 2), 4), (((1, 128), 512, 16) , 32))
+        #fx.make_layout((2, 2, 1), (1, 2, 0))
+        c_tv_layout =  fx.make_layout((((16, 4), 2, 2), 4), (((1, 128), 16, 512) , 32))   
+        tiled_copy_C = fx.make_tiled_copy(copy_atom_f32, c_tv_layout, c_tile_mn)
     
-    print(f'{tiled_copy_A=}')
-    print(f'{tiled_copy_B=}')
-    print(f'{tiled_copy_C=}')
-
+    fx.utils.print_typst(tiled_copy_C, file="tiled_copy_C.typ")
     thr_copy_A = tiled_copy_A.get_slice(tid)
     thr_copy_B = tiled_copy_B.get_slice(tid)
     thr_copy_C = tiled_copy_C.get_slice(tid)
+    frag_A = thr_mma.make_fragment_A(bA[None, None, 0])
+    frag_B = thr_mma.make_fragment_B(bB[None, None, 0])
+    frag_C = thr_mma.make_fragment_C(bC)
+    if const_expr(MFMA_BAC):
+        # c_fake_tensor = fx.make_view(
+        #         fx.get_iter(bC), fx.make_layout((block_n, block_m), (block_m, 1))
+        #     )
+        # frag_C = thr_mma.make_fragment_C(c_fake_tensor)
+        
+        frag_C = thr_mma.make_fragment_C(fx.select(bC,[1,0]))
 
     copy_src_A = thr_copy_A.partition_S(bA)
     copy_src_B = thr_copy_B.partition_S(bB)
-    copy_dst_C = thr_copy_C.partition_S(bC)
-
-    frag_A = thr_mma.make_fragment_A(bA)
-    frag_B = thr_mma.make_fragment_B(bB)
-    frag_C = thr_mma.make_fragment_C(bC)
+    
+    
+    # if const_expr(MFMA_BAC):
+    #     # bC = fx.select(bC, [1, 0])
+    #     bC = fx.composition(bC, fx.make_ordered_layout((block_n, block_m), (1, 0)))
+    #     print(f"###bC permuted: {bC}")
+    
 
     copy_frag_A = thr_copy_A.retile(frag_A)
     copy_frag_B = thr_copy_B.retile(frag_B)
+    frag_C.fill(0)
+
+    for kiter in fx.range_constexpr(K // block_k):
+        
+        fx.copy(copy_atom_bf16, copy_src_A[None, None, None, kiter], copy_frag_A, pred=None)
+        fx.copy(copy_atom_bf16, copy_src_B[None, None, None, kiter], copy_frag_B, pred=None)
+        if const_expr(MFMA_BAC):
+            # frag_C  = frag_B * frag_A
+            fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
+        else:
+            # frag_C  = frag_A * frag_B
+            fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)
+    if const_expr(MFMA_BAC):
+        frag_C = fx.select(frag_C, [0, 2, 1])
+    # copy_dst_C = thr_copy_C.partition_D(fx.select(bC, [1, 0]))
+    copy_dst_C = thr_copy_C.partition_D(bC)
     copy_frag_C = thr_copy_C.retile(frag_C)
 
-    print(f"{copy_src_A=}")
-    fx.copy(copy_atom, copy_src_A, copy_frag_A, pred=None)
-    fx.copy(copy_atom, copy_src_B, copy_frag_B, pred=None)
-
-    frag_C.fill(0)
-    fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
-
     fx.copy(copy_atom_f32, copy_frag_C, copy_dst_C, pred=None)
+
 
 
 @flyc.jit
@@ -86,22 +120,65 @@ def tiledMma(
     C: fx.Tensor,
     stream: fx.Stream = fx.Stream(None),
 ):
-    gemm_kernel(A, B, C).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    
+    # A = fx.view_as(A, fx.make_layout((M, K), (K, 1)))
+    # B = fx.view_as(B, fx.make_layout((N, K), (K, 1)))
+    # C = fx.view_as(C, fx.make_layout((M, N), (N, 1)))
+    gemm_kernel(A, B, C).launch(grid=(M // block_m, N // block_n, 1), block=(256, 1, 1), stream=stream)
 
-
-M, N, K = block_m, block_n, block_k
-A = torch.randn(M, K, dtype=torch.bfloat16).cuda()
-B = torch.randn(N, K, dtype=torch.bfloat16).cuda()
+A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
+B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 C = torch.zeros(M, N, dtype=torch.float32).cuda()
+expected = A.to(torch.float32) @ B.to(torch.float32).T
+
 
 tiledMma(A, B, C, stream=torch.cuda.Stream())
 
+# C00 = C[0:16, 0:16].T
+# C01 = C[0:16, 16:32].T
+# C10 = C[16:32, 0:16].T
+# C11 = C[16:32, 16:32].T
+
+# expected00 = expected[0:16, 0:16]
+# expected01 = expected[0:16, 16:32]
+# expected10 = expected[16:32, 0:16]
+# expected11 = expected[16:32, 16:32]
+
 torch.cuda.synchronize()
 
-expected = A.to(torch.float32) @ B.to(torch.float32).T
-is_correct = torch.allclose(C, expected, atol=1e-5, rtol=1e-5)
+# print(f'{C00=}')
+# print(f'{expected00=}')
+
+# print(f'{C01=}')
+# print(f'{expected01=}')
+# print(f'{C10=}')
+# print(f'{expected10=}')
+# print(f'{C11=}')
+# print(f'{expected11=}')
+
+torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+is_correct = torch.allclose(expected, C, atol=1e-5, rtol=1e-5)
+
 print("Result correct:", is_correct)
 if not is_correct:
-    print("Max diff:", (C - expected).abs().max().item())
-    print("Expected:", expected)
-    print("Got:", C)
+    m_tiles = block_m // 32
+    n_tiles = block_n // 32
+    for i in range(m_tiles):
+        base_m = i * 32
+        for j in range(n_tiles):
+            base_n = j * 32
+            C00 = C[base_m:base_m+16, base_n:base_n+16]
+            C01 = C[base_m:base_m+16, base_n+16:base_n+32]
+            C10 = C[base_m+16:base_m+32, base_n:base_n+16]
+            C11 = C[base_m+16:base_m+32, base_n+16:base_n+32]
+
+            expected00 = expected[base_m:base_m+16, base_n:base_n+16]
+            expected01 = expected[base_m:base_m+16, base_n+16:base_n+32]
+            expected10 = expected[base_m+16:base_m+32, base_n:base_n+16]
+            expected11 = expected[base_m+16:base_m+32, base_n+16:base_n+32]
+            
+            print(f'#################base_m={base_m}, base_n={base_n}#####################')
+            print(f'{C00=}\n, {expected00=}')
+            print(f'{C01=}\n, {expected01=}')
+            print(f'{C10=}\n, {expected10=}')
+            print(f'{C11=}\n, {expected11=}')
