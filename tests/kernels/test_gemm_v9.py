@@ -29,11 +29,14 @@ PADDING_ELEMS = 16
 PADDING_NUM = PADDING_ELEMS * (16 - 1)
 @fx.struct
 class LDS_PADDING:
-    a0: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
-    b0: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
-    a1: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
-    b1: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
-
+    lds0_a_t: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
+    lds0_a_b: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
+    lds0_b_l: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
+    lds0_b_r: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
+    lds1_a_t: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
+    lds1_a_b: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
+    lds1_b_l: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
+    lds1_b_r: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
 @flyc.kernel
 def gemm_kernel(
     A: fx.Tensor,
@@ -70,16 +73,26 @@ def gemm_kernel(
     lds_layout_wr =fx.make_layout(((8, 16), 64), ((64, 8*64+PADDING_ELEMS), 1))
     lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
-    ldsA0_rd = fx.make_view(lds.a0.ptr, lds_layout_rd)
-    ldsA1_rd = fx.make_view(lds.a1.ptr, lds_layout_rd)
-    ldsA0_wr = fx.make_view(lds.a0.ptr, lds_layout_wr)
-    ldsA1_wr = fx.make_view(lds.a1.ptr, lds_layout_wr)
-    
-    ldsB0_rd = fx.make_view(lds.b0.ptr, lds_layout_rd)
-    ldsB1_rd = fx.make_view(lds.b1.ptr, lds_layout_rd)
-    ldsB0_wr = fx.make_view(lds.b0.ptr, lds_layout_wr)
-    ldsB1_wr = fx.make_view(lds.b1.ptr, lds_layout_wr)
+    #LDS 0
+    lds0_A_t_rd = fx.make_view(lds.lds0_a_t.ptr, lds_layout_rd)
+    lds0_A_b_rd = fx.make_view(lds.lds0_a_b.ptr, lds_layout_rd)
+    lds0_A_t_wr = fx.make_view(lds.lds0_a_t.ptr, lds_layout_wr)
+    lds0_A_b_wr = fx.make_view(lds.lds0_a_b.ptr, lds_layout_wr)
+    lds0_B_l_rd = fx.make_view(lds.lds0_b_l.ptr, lds_layout_rd)
+    lds0_B_r_rd = fx.make_view(lds.lds0_b_r.ptr, lds_layout_rd)
+    lds0_B_l_wr = fx.make_view(lds.lds0_b_l.ptr, lds_layout_wr)
+    lds0_B_r_wr = fx.make_view(lds.lds0_b_r.ptr, lds_layout_wr)
 
+    #LDS 1
+    lds1_A_t_rd = fx.make_view(lds.lds1_a_t.ptr, lds_layout_rd)
+    lds1_A_b_rd = fx.make_view(lds.lds1_a_b.ptr, lds_layout_rd)
+    lds1_A_t_wr = fx.make_view(lds.lds1_a_t.ptr, lds_layout_wr)
+    lds1_A_b_wr = fx.make_view(lds.lds1_a_b.ptr, lds_layout_wr)
+    lds1_B_l_rd = fx.make_view(lds.lds1_b_l.ptr, lds_layout_rd)
+    lds1_B_r_rd = fx.make_view(lds.lds1_b_r.ptr, lds_layout_rd)
+    lds1_B_l_wr = fx.make_view(lds.lds1_b_l.ptr, lds_layout_wr)
+    lds1_B_r_wr = fx.make_view(lds.lds1_b_r.ptr, lds_layout_wr)
+    
     # copy atoms
     async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
     lsd_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
@@ -96,10 +109,16 @@ def gemm_kernel(
     ac_src_A_b = ac_thr.partition_S(bA_b)
     ac_src_B_l = ac_thr.partition_S(bB_l)
     ac_src_B_r = ac_thr.partition_S(bB_r)
-    ac_dest_A0 = ac_thr.partition_D(ldsA0_wr)
-    ac_dest_A1 = ac_thr.partition_D(ldsA1_wr)
-    ac_dest_B0 = ac_thr.partition_D(ldsB0_wr)
-    ac_dest_B1 = ac_thr.partition_D(ldsB1_wr)
+    #LDS0
+    ac_dest0_A_t = ac_thr.partition_D(lds0_A_t_wr)
+    ac_dest0_A_b = ac_thr.partition_D(lds0_A_b_wr)
+    ac_dest0_B_l = ac_thr.partition_D(lds0_B_l_wr)
+    ac_dest0_B_r = ac_thr.partition_D(lds0_B_r_wr)
+    #LDS1
+    ac_dest1_A_t = ac_thr.partition_D(lds1_A_t_wr)
+    ac_dest1_A_b = ac_thr.partition_D(lds1_A_b_wr)
+    ac_dest1_B_l = ac_thr.partition_D(lds1_B_l_wr)
+    ac_dest1_B_r = ac_thr.partition_D(lds1_B_r_wr)
 
     # tiled MMA, thread MMA
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
@@ -132,10 +151,10 @@ def gemm_kernel(
     #c=B*A, fx.gemm(mma_atom, C, B, A, C)
     #所以m_iter = n_rep, n_iter = m_rep, 
     #对frgaC的访问，frag_C[None, m_iter, n_iter]实际上是frag_C[None, n_rep, m_rep]
-    frag_A_t = thr_mma.make_fragment_A(ldsA0_rd)
-    frag_A_b = thr_mma.make_fragment_A(ldsA1_rd)
-    frag_B_l = thr_mma.make_fragment_B(ldsB0_rd)
-    frag_B_r = thr_mma.make_fragment_B(ldsB1_rd)
+    frag_A_t = thr_mma.make_fragment_A(lds0_A_t_rd)
+    frag_A_b = thr_mma.make_fragment_A(lds0_A_b_rd)
+    frag_B_l = thr_mma.make_fragment_B(lds0_B_l_rd)
+    frag_B_r = thr_mma.make_fragment_B(lds0_B_r_rd)
     #frag_C(val, m_rep, n_rep] -> frag_C[val, n_rep, m_rep]
     frag_C_tl = thr_mma.make_fragment_C(fx.select(bC_tl,[1,0]))
     frag_C_tr = thr_mma.make_fragment_C(fx.select(bC_tr,[1,0]))
@@ -145,10 +164,15 @@ def gemm_kernel(
     # from LDS to reigster partition
     ldsA_rd_thread = s2r_tiled_copy_A.get_slice(tid)
     ldsB_rd_thread = s2r_tiled_copy_B.get_slice(tid)
-    s2r_src_A_t = ldsA_rd_thread.partition_S(ldsA0_rd)
-    s2r_src_A_b = ldsA_rd_thread.partition_S(ldsA1_rd)
-    s2r_src_B_l = ldsB_rd_thread.partition_S(ldsB0_rd)
-    s2r_src_B_r = ldsB_rd_thread.partition_S(ldsB1_rd)
+    s2r_src0_A_t = ldsA_rd_thread.partition_S(lds0_A_t_rd)
+    s2r_src0_A_b = ldsA_rd_thread.partition_S(lds0_A_b_rd)
+    s2r_src0_B_l = ldsB_rd_thread.partition_S(lds0_B_l_rd)
+    s2r_src0_B_r = ldsB_rd_thread.partition_S(lds0_B_r_rd)
+    
+    s2r_src1_A_t = ldsA_rd_thread.partition_S(lds1_A_t_rd)
+    s2r_src1_A_b = ldsA_rd_thread.partition_S(lds1_A_b_rd)
+    s2r_src1_B_l = ldsB_rd_thread.partition_S(lds1_B_l_rd)
+    s2r_src1_B_r = ldsB_rd_thread.partition_S(lds1_B_r_rd)
     ###MMA fragments retile to des
     dest_frag_A_t = ldsA_rd_thread.retile(frag_A_t)
     dest_frag_A_b = ldsA_rd_thread.retile(frag_A_b)
@@ -160,8 +184,9 @@ def gemm_kernel(
     frag_C_bl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
     frag_C_br.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
     acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
-        
-    for kidx, states in range(0, K // BLOCK_K - 0, 1, init=acc_init):    
+    
+    
+    for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
     # for kiter in fx.range_constexpr(K // BLOCK_K):
         frag_C_tl.store(states[0])
         frag_C_tr.store(states[1])
@@ -169,27 +194,79 @@ def gemm_kernel(
         frag_C_br.store(states[3])
         kiter = fx.Int32(kidx)
 
-        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter], ac_dest_A0)
-        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter], ac_dest_A1)
-        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter], ac_dest_B0)
-        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter], ac_dest_B1)
+        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter], ac_dest0_A_t)
+        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter], ac_dest0_B_l)
         gpu.barrier()
-        fx.copy(lsd_copy_atom, s2r_src_A_t, dest_frag_A_t, pred=None)
-        fx.copy(lsd_copy_atom, s2r_src_A_b, dest_frag_A_b, pred=None)
-        fx.copy(lsd_copy_atom, s2r_src_B_l, dest_frag_B_l, pred=None)
-        fx.copy(lsd_copy_atom, s2r_src_B_r, dest_frag_B_r, pred=None)
-        # frag_C  = frag_B * frag_A
+        fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
-        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+
+        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter], ac_dest0_A_b)
         gpu.barrier()
+        fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
+        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+
+        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter], ac_dest0_B_r)
+        gpu.barrier()
+        fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
+        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)        
+        # frag_C  = frag_B * frag_A
+        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+
+        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+1], ac_dest1_A_t)
+        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+1], ac_dest1_B_l)
+        gpu.barrier()
+        fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
+        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+
+        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+1], ac_dest1_A_b)
+        gpu.barrier()
+        fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+
+        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+1], ac_dest1_B_r)
+        gpu.barrier()
+        fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
+        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)        
+        # frag_C  = frag_B * frag_A
+        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
         results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
     frag_C_tl.store(results[0])
     frag_C_tr.store(results[1])
     frag_C_bl.store(results[2])
     frag_C_br.store(results[3])
+
+    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, K // BLOCK_K - 2], ac_dest0_A_t)
+    fx.copy(async_copy_atom, ac_src_A_b[None, None, None, K // BLOCK_K - 2], ac_dest0_A_b)
+    fx.copy(async_copy_atom, ac_src_B_l[None, None, None, K // BLOCK_K - 2], ac_dest0_B_l)
+    fx.copy(async_copy_atom, ac_src_B_r[None, None, None, K // BLOCK_K - 2], ac_dest0_B_r)
+    gpu.barrier()
+    fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
+    fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+    fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    gpu.barrier()
+    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, K // BLOCK_K - 1], ac_dest0_A_t)
+    fx.copy(async_copy_atom, ac_src_A_b[None, None, None, K // BLOCK_K - 1], ac_dest0_A_b)
+    fx.copy(async_copy_atom, ac_src_B_l[None, None, None, K // BLOCK_K - 1], ac_dest0_B_l)
+    fx.copy(async_copy_atom, ac_src_B_r[None, None, None, K // BLOCK_K - 1], ac_dest0_B_r)
+    gpu.barrier()
+    fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
+    fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
+    fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+    fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    gpu.barrier()
+
     frag_C_tl = fx.select(frag_C_tl, [0, 2, 1])
     frag_C_tr = fx.select(frag_C_tr, [0, 2, 1])
     frag_C_bl = fx.select(frag_C_bl, [0, 2, 1])
@@ -209,8 +286,6 @@ def gemm_kernel(
     fx.copy(buffer_copy_atom_f32, src_frag_C_tr, dst_C_tr, pred=None)
     fx.copy(buffer_copy_atom_f32, src_frag_C_bl, dst_C_bl, pred=None)
     fx.copy(buffer_copy_atom_f32, src_frag_C_br, dst_C_br, pred=None)
-
-
 
 @flyc.jit
 def tiledMma(
