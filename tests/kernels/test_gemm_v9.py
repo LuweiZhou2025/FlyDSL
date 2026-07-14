@@ -12,13 +12,16 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
 BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 64
-M = BLOCK_M *16
-N = BLOCK_N*16
-K = BLOCK_K*32
+TILE_M = BLOCK_M*2
+TILE_N = BLOCK_N*2
+TILE_K = BLOCK_K*1
+M = TILE_M *16
+N = TILE_N*16
+K = TILE_K*32
 if 0:
-    M = BLOCK_M
-    N = BLOCK_N
-    K = BLOCK_K * 4
+    M = TILE_M
+    N = TILE_N
+    K = TILE_K * 4
 
 
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
@@ -28,6 +31,8 @@ PADDING_NUM = PADDING_ELEMS * (16 - 1)
 class LDS_PADDING:
     a0: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
     b0: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
+    a1: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
+    b1: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
 
 @flyc.kernel
 def gemm_kernel(
@@ -41,14 +46,24 @@ def gemm_kernel(
     A = fx.rocdl.make_buffer_tensor(A)
     B = fx.rocdl.make_buffer_tensor(B)
     C = fx.rocdl.make_buffer_tensor(C)
-    # A, B read layout
-    B = fx.Tensor(fx.make_view(fx.get_iter(B), fx.make_layout(((8, BLOCK_N//8, N//BLOCK_N), K), ((BLOCK_N//8*K, K, BLOCK_N*K), 1))))
-    A = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout(((8, BLOCK_M//8, M//BLOCK_M), K), ((BLOCK_M//8*K, K, BLOCK_M*K), 1))))
 
-    bA = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x, None]  # (BM, BK, k)
-    bB = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y, None]  # (BN, BK, k)
-    bC = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x, bid_y]  # (BM, BN)
+    bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 0, None]  # (BM, BK, k)
+    bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 1, None]  # (BM, BK, k)
+    bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y*2 + 0, None]  # (BN, BK, k)
+    bB_r = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y*2 + 1, None]  # (BN, BK, k)
     
+    bC_tl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 0, bid_y*2 + 0]  # (BM, BN)
+    bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 0, bid_y*2 + 1]  # (BM, BN)
+    bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 0]  # (BM, BN)
+    bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 1]  # (BM, BN)
+
+    # A, B read layout
+    bA_layout = fx.make_layout(((8, BLOCK_M//8), BLOCK_K, K//BLOCK_K), ((BLOCK_M//8*K, K), 1, BLOCK_K))
+    bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), bA_layout))
+    bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), bA_layout))
+    bB_layout = fx.make_layout(((8, BLOCK_N//8), BLOCK_K, K//BLOCK_K), ((BLOCK_N//8*K, K), 1, BLOCK_K))
+    bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), bB_layout))
+    bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), bB_layout))
 
     # read and write LDS tensor view.
     lds_layout_rd =fx.make_layout(((16, 8), (32, 2)), ((512+PADDING_ELEMS, 64), (1, 32)))
@@ -56,10 +71,14 @@ def gemm_kernel(
     lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
     ldsA0_rd = fx.make_view(lds.a0.ptr, lds_layout_rd)
+    ldsA1_rd = fx.make_view(lds.a1.ptr, lds_layout_rd)
     ldsA0_wr = fx.make_view(lds.a0.ptr, lds_layout_wr)
-
+    ldsA1_wr = fx.make_view(lds.a1.ptr, lds_layout_wr)
+    
     ldsB0_rd = fx.make_view(lds.b0.ptr, lds_layout_rd)
+    ldsB1_rd = fx.make_view(lds.b1.ptr, lds_layout_rd)
     ldsB0_wr = fx.make_view(lds.b0.ptr, lds_layout_wr)
+    ldsB1_wr = fx.make_view(lds.b1.ptr, lds_layout_wr)
 
     # copy atoms
     async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
@@ -73,11 +92,15 @@ def gemm_kernel(
     ac_tiled_copy = fx.make_tiled_copy(buffer_copy_atom_bf16, ac_tv_layout, ac_tile_mn)
     ac_thr = ac_tiled_copy.get_slice(tid)
     # DMA copy partition src, dest
-    ac_B_src = ac_thr.partition_S(bB)
-    ac_B_dest = ac_thr.partition_D(ldsB0_wr)
-    ac_A_src = ac_thr.partition_S(bA)
-    ac_A_dest = ac_thr.partition_D(ldsA0_wr)
-    
+    ac_src_A_t = ac_thr.partition_S(bA_t)
+    ac_src_A_b = ac_thr.partition_S(bA_b)
+    ac_src_B_l = ac_thr.partition_S(bB_l)
+    ac_src_B_r = ac_thr.partition_S(bB_r)
+    ac_dest_A0 = ac_thr.partition_D(ldsA0_wr)
+    ac_dest_A1 = ac_thr.partition_D(ldsA1_wr)
+    ac_dest_B0 = ac_thr.partition_D(ldsB0_wr)
+    ac_dest_B1 = ac_thr.partition_D(ldsB1_wr)
+
     # tiled MMA, thread MMA
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
     #tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (2, 1, 0)))
@@ -109,45 +132,83 @@ def gemm_kernel(
     #c=B*A, fx.gemm(mma_atom, C, B, A, C)
     #所以m_iter = n_rep, n_iter = m_rep, 
     #对frgaC的访问，frag_C[None, m_iter, n_iter]实际上是frag_C[None, n_rep, m_rep]
-    frag_A = thr_mma.make_fragment_A(ldsA0_rd)
-    frag_B = thr_mma.make_fragment_B(ldsB0_rd)
+    frag_A_t = thr_mma.make_fragment_A(ldsA0_rd)
+    frag_A_b = thr_mma.make_fragment_A(ldsA1_rd)
+    frag_B_l = thr_mma.make_fragment_B(ldsB0_rd)
+    frag_B_r = thr_mma.make_fragment_B(ldsB1_rd)
     #frag_C(val, m_rep, n_rep] -> frag_C[val, n_rep, m_rep]
-    frag_C = thr_mma.make_fragment_C(fx.select(bC,[1,0]))
+    frag_C_tl = thr_mma.make_fragment_C(fx.select(bC_tl,[1,0]))
+    frag_C_tr = thr_mma.make_fragment_C(fx.select(bC_tr,[1,0]))
+    frag_C_bl = thr_mma.make_fragment_C(fx.select(bC_bl,[1,0]))
+    frag_C_br = thr_mma.make_fragment_C(fx.select(bC_br,[1,0]))
     
-    # B from LDS to reigster partition
+    # from LDS to reigster partition
     ldsA_rd_thread = s2r_tiled_copy_A.get_slice(tid)
     ldsB_rd_thread = s2r_tiled_copy_B.get_slice(tid)
-    s2r_B0_src = ldsB_rd_thread.partition_S(ldsB0_rd)
-    s2r_A0_src = ldsA_rd_thread.partition_S(ldsA0_rd)
+    s2r_src_A_t = ldsA_rd_thread.partition_S(ldsA0_rd)
+    s2r_src_A_b = ldsA_rd_thread.partition_S(ldsA1_rd)
+    s2r_src_B_l = ldsB_rd_thread.partition_S(ldsB0_rd)
+    s2r_src_B_r = ldsB_rd_thread.partition_S(ldsB1_rd)
+    ###MMA fragments retile to des
+    dest_frag_A_t = ldsA_rd_thread.retile(frag_A_t)
+    dest_frag_A_b = ldsA_rd_thread.retile(frag_A_b)
+    dest_frag_B_l = ldsB_rd_thread.retile(frag_B_l)
+    dest_frag_B_r = ldsB_rd_thread.retile(frag_B_r)
 
-    ###MMA fragments
-    thr_copy_C = tiled_copy_C.get_slice(tid)
-    copy_dst_C = thr_copy_C.partition_D(bC)
-
-    copy_frag_A = ldsA_rd_thread.retile(frag_A)
-    copy_frag_B = ldsB_rd_thread.retile(frag_B)
-
-    frag_C.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
-    acc_init = [frag_C.load()]
+    frag_C_tl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_tr.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_bl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_br.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
         
     for kidx, states in range(0, K // BLOCK_K - 0, 1, init=acc_init):    
     # for kiter in fx.range_constexpr(K // BLOCK_K):
-        frag_C.store(states[0])
+        frag_C_tl.store(states[0])
+        frag_C_tr.store(states[1])
+        frag_C_bl.store(states[2])
+        frag_C_br.store(states[3])
         kiter = fx.Int32(kidx)
+
+        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter], ac_dest_A0)
+        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter], ac_dest_A1)
+        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter], ac_dest_B0)
+        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter], ac_dest_B1)
         gpu.barrier()
-        fx.copy(async_copy_atom, ac_B_src[None, None, None, kiter], ac_B_dest)
-        fx.copy(async_copy_atom, ac_A_src[None, None, None, kiter], ac_A_dest)
-        gpu.barrier()
-        fx.copy(lsd_copy_atom, s2r_A0_src, copy_frag_A, pred=None)
-        fx.copy(lsd_copy_atom, s2r_B0_src, copy_frag_B, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src_A_t, dest_frag_A_t, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src_A_b, dest_frag_A_b, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src_B_l, dest_frag_B_l, pred=None)
+        fx.copy(lsd_copy_atom, s2r_src_B_r, dest_frag_B_r, pred=None)
         # frag_C  = frag_B * frag_A
-        fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
-        results = yield [frag_C.load()]
+        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+        gpu.barrier()
+        results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
-    frag_C.store(results)
-    frag_C = fx.select(frag_C, [0, 2, 1])
-    copy_frag_C = thr_copy_C.retile(frag_C)
-    fx.copy(buffer_copy_atom_f32, copy_frag_C, copy_dst_C, pred=None)
+    frag_C_tl.store(results[0])
+    frag_C_tr.store(results[1])
+    frag_C_bl.store(results[2])
+    frag_C_br.store(results[3])
+    frag_C_tl = fx.select(frag_C_tl, [0, 2, 1])
+    frag_C_tr = fx.select(frag_C_tr, [0, 2, 1])
+    frag_C_bl = fx.select(frag_C_bl, [0, 2, 1])
+    frag_C_br = fx.select(frag_C_br, [0, 2, 1])
+    
+    thr_copy_C = tiled_copy_C.get_slice(tid)
+    dst_C_tl = thr_copy_C.partition_D(bC_tl)
+    dst_C_tr = thr_copy_C.partition_D(bC_tr)
+    dst_C_bl = thr_copy_C.partition_D(bC_bl)
+    dst_C_br = thr_copy_C.partition_D(bC_br)
+    
+    src_frag_C_tl = thr_copy_C.retile(frag_C_tl)
+    src_frag_C_tr = thr_copy_C.retile(frag_C_tr)
+    src_frag_C_bl = thr_copy_C.retile(frag_C_bl)
+    src_frag_C_br = thr_copy_C.retile(frag_C_br)
+    fx.copy(buffer_copy_atom_f32, src_frag_C_tl, dst_C_tl, pred=None)
+    fx.copy(buffer_copy_atom_f32, src_frag_C_tr, dst_C_tr, pred=None)
+    fx.copy(buffer_copy_atom_f32, src_frag_C_bl, dst_C_bl, pred=None)
+    fx.copy(buffer_copy_atom_f32, src_frag_C_br, dst_C_br, pred=None)
 
 
 
@@ -159,7 +220,7 @@ def tiledMma(
     stream: fx.Stream = fx.Stream(None),
 ):
     
-    gemm_kernel(A, B, C).launch(grid=(M // BLOCK_M, N // BLOCK_N, 1), block=(256, 1, 1), stream=stream)
+    gemm_kernel(A, B, C).launch(grid=(M //(TILE_M), N // (TILE_N), 1), block=(256, 1, 1), stream=stream)
 
 assert BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "BLOCK_M, BLOCK_N, BLOCK_K must be 128, 128, 64"
 A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
