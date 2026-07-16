@@ -24,15 +24,13 @@ if 0:
     N = TILE_N
     K = TILE_K * 4
 
-
-
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 USE_SWIZZLE=_env_flag("SWIZZLE", "0")
 PADDING_ELEMS = 16
-PADDING_NUM = PADDING_ELEMS * (16 - 1)
+PADDING_NUM = PADDING_ELEMS * 16
 if USE_SWIZZLE:
     PADDING_NUM = 0
 def enable_dump_ir(enable_debug_info=True):
@@ -66,6 +64,17 @@ def wait_barrier(count):
         constraints="",
         has_side_effects=True,
     )
+
+def hot_loop_scheduler_mainloop():
+        rocdl.sched_mfma(6)
+        for _ in range_constexpr(8):
+            rocdl.sched_dsrd(1)
+            rocdl.sched_mfma(1)
+        rocdl.sched_mfma(1)
+        for _ in range_constexpr(4):
+            rocdl.sched_vmem(1)
+            rocdl.sched_mfma(4)
+        rocdl.sched_mfma(1)
 @fx.struct
 class LDS_PADDING:
     lds_a_t: fx.Array[BFloat16, 2*(BLOCK_M*BLOCK_K+PADDING_NUM), 16]
@@ -99,8 +108,8 @@ def gemm_kernel(
             fx.static(fx.SwizzleType.get(3, 3, num_shift)),
             fx.get_layout(B),
         )
-        # A =fx.make_view(fx.get_iter(A), GA_SWIZZLE_LAYOUT)
-        # B =fx.make_view(fx.get_iter(B), GB_SWIZZLE_LAYOUT)
+        A =fx.make_view(fx.get_iter(A), GA_SWIZZLE_LAYOUT)
+        B =fx.make_view(fx.get_iter(B), GB_SWIZZLE_LAYOUT)
         
     bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 0, None]  # (BM, BK, k)
     bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 1, None]  # (BM, BK, k)
@@ -121,16 +130,16 @@ def gemm_kernel(
         bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), bB_layout))
 
     # read and write LDS tensor view.
-    lds_layout_rd =fx.make_layout(((16, 8), (32, 2)), ((512+PADDING_ELEMS, 64), (1, 32)))
-    lds_layout_wr =fx.make_layout(((8, 16), 64), ((64, 8*64+PADDING_ELEMS), 1))
+    lds_layout_rd =fx.make_layout(((16, 8), (32, 2), 2), ((512+PADDING_ELEMS, 64), (1, 32), ((BLOCK_M*BLOCK_K+PADDING_NUM))))
+    lds_layout_wr =fx.make_layout(((8, 16), 64, 2), ((64, 8*64+PADDING_ELEMS), 1, ((BLOCK_M*BLOCK_K+PADDING_NUM))))
     if USE_SWIZZLE:
         lds_layout_wr =fx.make_ordered_layout((BLOCK_M, BLOCK_K, 2), (1, 0, 2))
         print(f'##lds_layout_wr={lds_layout_wr}')
         lds_layout_rd = lds_layout_wr
-        # lds_layout_rd = fx.make_composed_layout(
-        #     fx.static(fx.SwizzleType.get(3, 3, 3)),
-        #     lds_layout_wr,
-        # )
+        lds_layout_rd = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(3, 3, 3)),
+            lds_layout_wr,
+        )
     lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
     #LDS [BM, BK, 2]
@@ -229,29 +238,27 @@ def gemm_kernel(
     acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     
     rocdl.sched_barrier(0)
-    print(f'####as2r_src_B_l={s2r_src_B_l}')
-    print(f'####ac_dest_A_t={ac_dest_A_t[None, None, None, 0]}')
-    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, 0], ac_dest_A_t[None, None, None, 0])
-    rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_B_l[None, None, None, 0], ac_dest_B_l[None, None, None, 0])
+    rocdl.sched_barrier(0)
+    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, 0], ac_dest_A_t[None, None, None, 0])
     rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_A_b[None, None, None, 0], ac_dest_A_b[None, None, None, 0])
     rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_B_r[None, None, None, 0], ac_dest_B_r[None, None, None, 0])
     rocdl.sched_barrier(0)
-
-    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, 1], ac_dest_A_t[None, None, None, 1])
-    rocdl.sched_barrier(0)
-
+    
     fx.copy(async_copy_atom, ac_src_B_l[None, None, None, 1], ac_dest_B_l[None, None, None,1])
+    rocdl.sched_barrier(0)
+    fx.copy(async_copy_atom, ac_src_A_t[None, None, None, 1], ac_dest_A_t[None, None, None, 1])
     rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_A_b[None, None, None, 1], ac_dest_A_b[None, None, None,1])
     rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_B_r[None, None, None, 1], ac_dest_B_r[None, None, None, 1])
     rocdl.sched_barrier(0)
     
-    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=24))
-    gpu.barrier()
+    wait_barrier(24)
+    # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=24))
+    # gpu.barrier()
     fx.copy(lsd_copy_atom, s2r_src_B_l[None, None, None, 0], dest_frag_B_l, pred=None)
     fx.copy(lsd_copy_atom, s2r_src_A_t[None, None, None, 0], dest_frag_A_t, pred=None)
     rocdl.sched_barrier(0)
@@ -262,41 +269,43 @@ def gemm_kernel(
         frag_C_br.store(states[3])
         kiter = fx.Int32(kidx)
         
-        cur_idx = kiter %  2
-        next_idx = 1 - cur_idx
-        
-        rocdl.sched_barrier(0)
+        ping_idx = kiter %  2
+        pong_idx = 1 - ping_idx
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest_B_l[None, None, None, cur_idx])
-        fx.copy(lsd_copy_atom, s2r_src_A_b[None, None, None, cur_idx], dest_frag_A_b, pred=None)
+        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest_B_l[None, None, None, ping_idx])
+        fx.copy(lsd_copy_atom, s2r_src_A_b[None, None, None, ping_idx], dest_frag_A_b, pred=None)
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
-        
+        hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
+    
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest_A_t[None, None, None, cur_idx])
-        fx.copy(lsd_copy_atom, s2r_src_B_r[None, None, None, cur_idx], dest_frag_B_r, pred=None)
-
+        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest_A_t[None, None, None, ping_idx])
+        fx.copy(lsd_copy_atom, s2r_src_B_r[None, None, None, ping_idx], dest_frag_B_r, pred=None)
+        hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
+    
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest_A_b[None, None, None, cur_idx])
-        fx.copy(lsd_copy_atom, s2r_src_B_l[None, None, None, next_idx], dest_frag_B_l, pred=None)
-
+        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest_A_b[None, None, None, ping_idx])
+        fx.copy(lsd_copy_atom, s2r_src_B_l[None, None, None, pong_idx], dest_frag_B_l, pred=None)
+        hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
+    
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
-        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest_B_r[None, None, None, cur_idx])
-        fx.copy(lsd_copy_atom, s2r_src_A_t[None, None, None, next_idx], dest_frag_A_t, pred=None)
-         
+        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest_B_r[None, None, None, ping_idx])
+        fx.copy(lsd_copy_atom, s2r_src_A_t[None, None, None, pong_idx], dest_frag_A_t, pred=None)
+        hot_loop_scheduler_mainloop()
+        rocdl.sched_barrier(0)
         results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
     frag_C_tl.store(results[0])
