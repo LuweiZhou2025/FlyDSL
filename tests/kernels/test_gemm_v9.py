@@ -3,6 +3,7 @@
 
 import torch
 import math
+import pyhip
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.compiler as flyc
@@ -18,7 +19,7 @@ TILE_N = BLOCK_N*2
 TILE_K = BLOCK_K*1
 M = TILE_M *16
 N = TILE_N*16
-K = TILE_K*16
+K = TILE_K*64
 if 0:
     M = TILE_M
     N = TILE_N
@@ -274,9 +275,9 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest_B_l[None, None, None, ping_idx])
-        fx.copy(lsd_copy_atom, s2r_src_A_b[None, None, None, ping_idx], dest_frag_A_b, pred=None)
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        fx.copy(lsd_copy_atom, s2r_src_A_b[None, None, None, ping_idx], dest_frag_A_b, pred=None)
+        fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest_B_l[None, None, None, ping_idx])
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
     
@@ -284,8 +285,8 @@ def gemm_kernel(
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest_A_t[None, None, None, ping_idx])
         fx.copy(lsd_copy_atom, s2r_src_B_r[None, None, None, ping_idx], dest_frag_B_r, pred=None)
+        fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest_A_t[None, None, None, ping_idx])
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
     
@@ -293,8 +294,8 @@ def gemm_kernel(
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest_A_b[None, None, None, ping_idx])
         fx.copy(lsd_copy_atom, s2r_src_B_l[None, None, None, pong_idx], dest_frag_B_l, pred=None)
+        fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest_A_b[None, None, None, ping_idx])
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
     
@@ -302,8 +303,8 @@ def gemm_kernel(
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
         fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
-        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest_B_r[None, None, None, ping_idx])
         fx.copy(lsd_copy_atom, s2r_src_A_t[None, None, None, pong_idx], dest_frag_A_t, pred=None)
+        fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest_B_r[None, None, None, ping_idx])
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
         results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
@@ -417,6 +418,61 @@ torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 is_correct = torch.allclose(expected, C, atol=1e-5, rtol=1e-5)
 
 print(f'{USE_SWIZZLE=} {is_correct=}')
+
+
+def compare_perf(run_count=30, data_clones=40):
+    _A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
+    _B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
+    _C = torch.zeros(M, N, dtype=torch.float32).cuda()
+
+    _hints = {"opt_level": 2, "llvm_options": {"amdgpu-mfma-vgpr-form": False}}
+    _stream = torch.cuda.current_stream()
+    _compiled = flyc.compile[_hints](launch_gemm, _A, _B, _C, _stream)
+
+    # accuracy
+    _expected = _A.to(torch.float32) @ _B.to(torch.float32).T
+    _compiled(_A, _B, _C, _stream)
+    torch.cuda.synchronize()
+    acc = "pass" if torch.allclose(_expected, _C, atol=1e-5, rtol=1e-5) else "failed"
+
+    As = [torch.randn(M, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
+    Bs = [torch.randn(N, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
+    Cs = [torch.zeros(M, N, dtype=torch.float32).cuda() for _ in range(data_clones)]
+
+    flops = 2 * M * N * K
+    mem_bytes = (M * K + N * K) * 2  # bf16 A+B
+
+    di = 0
+    latencies = []
+    torch_latencies = []
+
+    for _ in range(run_count):
+        di = (di + 1) % data_clones
+        with pyhip.cudaPerf(flops, mem_bytes, name=f"gemm_{di}") as p:
+            _compiled(As[di], Bs[di], Cs[di], _stream)
+        latencies.append(p.dt_ms)
+
+    # for _ in range(run_count):
+    #     di = (di + 1) % data_clones
+    #     with pyhip.cudaPerf(flops, mem_bytes, name=f"torch_{di}") as p:
+    #         _ = torch.nn.functional.linear(As[di], Bs[di]) 
+    #     torch_latencies.append(p.dt_ms)
+
+    latencies.sort()
+    torch_latencies.sort()
+
+    best_ms = latencies[0]
+    tflops = flops / (best_ms * 1e-3) / 1e12
+    bw_gbs = mem_bytes / (best_ms * 1e-3) / 1e9
+
+    print(f"\n=== compare_perf  M={M} N={N} K={K} ===")
+    print(f"acc:   {acc}")
+    print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
+    print(f"torch: {torch_latencies[0]*1e3:.1f} us")
+    print(f"ratio: {torch_latencies[0]/best_ms:.2f}x")
+
+
+compare_perf()
 # if not is_correct:
 #     m_tiles = BLOCK_M // 32
 #     n_tiles = BLOCK_N // 32
