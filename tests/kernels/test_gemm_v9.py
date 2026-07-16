@@ -9,7 +9,7 @@ import flydsl.compiler as flyc
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T, Vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
 import os
-
+from flydsl._mlir.dialects import llvm as _llvm
 BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 64
@@ -25,10 +25,16 @@ if 0:
     K = TILE_K * 4
 
 
+
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+USE_SWIZZLE=_env_flag("SWIZZLE", "0")
 PADDING_ELEMS = 16
 PADDING_NUM = PADDING_ELEMS * (16 - 1)
-
+if USE_SWIZZLE:
+    PADDING_NUM = 0
 def enable_dump_ir(enable_debug_info=True):
     if enable_debug_info:
         import flydsl
@@ -52,6 +58,14 @@ def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     vm_hi = (vmcnt >> 4) & 0x3
     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
+def wait_barrier(count):
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+        constraints="",
+        has_side_effects=True,
+    )
 @fx.struct
 class LDS_PADDING:
     lds0_a_t: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
@@ -71,10 +85,26 @@ def gemm_kernel(
     tid = fx.thread_idx.x
     bid_x, bid_y, _ = fx.block_idx
 
-    A = fx.rocdl.make_buffer_tensor(A)
-    B = fx.rocdl.make_buffer_tensor(B)
-    C = fx.rocdl.make_buffer_tensor(C)
+    A = fx.rocdl.make_buffer_tensor(A,  max_size=False)
+    B = fx.rocdl.make_buffer_tensor(B,  max_size=False)
+    C = fx.rocdl.make_buffer_tensor(C,  max_size=False)
 
+    if USE_SWIZZLE:
+        num_base = 3
+        num_bits = 3
+        num_shift = K.bit_length() - 1 - num_base 
+        
+        GA_SWIZZLE_LAYOUT = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(3, 3, num_shift)),
+            fx.get_layout(A),
+        )
+        GB_SWIZZLE_LAYOUT = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(3, 3, num_shift)),
+            fx.get_layout(B),
+        )
+        # A =fx.make_view(fx.get_iter(A), GA_SWIZZLE_LAYOUT)
+        # B =fx.make_view(fx.get_iter(B), GB_SWIZZLE_LAYOUT)
+        
     bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 0, None]  # (BM, BK, k)
     bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 1, None]  # (BM, BK, k)
     bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y*2 + 0, None]  # (BN, BK, k)
@@ -84,18 +114,25 @@ def gemm_kernel(
     bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 0, bid_y*2 + 1]  # (BM, BN)
     bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 0]  # (BM, BN)
     bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 1]  # (BM, BN)
-
-    # A, B read layout
-    bA_layout = fx.make_layout(((8, BLOCK_M//8), BLOCK_K, K//BLOCK_K), ((BLOCK_M//8*K, K), 1, BLOCK_K))
-    bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), bA_layout))
-    bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), bA_layout))
-    bB_layout = fx.make_layout(((8, BLOCK_N//8), BLOCK_K, K//BLOCK_K), ((BLOCK_N//8*K, K), 1, BLOCK_K))
-    bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), bB_layout))
-    bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), bB_layout))
+    if not USE_SWIZZLE:
+        # A, B read layout
+        bA_layout = fx.make_layout(((8, BLOCK_M//8), BLOCK_K, K//BLOCK_K), ((BLOCK_M//8*K, K), 1, BLOCK_K))
+        bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), bA_layout))
+        bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), bA_layout))
+        bB_layout = fx.make_layout(((8, BLOCK_N//8), BLOCK_K, K//BLOCK_K), ((BLOCK_N//8*K, K), 1, BLOCK_K))
+        bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), bB_layout))
+        bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), bB_layout))
 
     # read and write LDS tensor view.
     lds_layout_rd =fx.make_layout(((16, 8), (32, 2)), ((512+PADDING_ELEMS, 64), (1, 32)))
     lds_layout_wr =fx.make_layout(((8, 16), 64), ((64, 8*64+PADDING_ELEMS), 1))
+    if USE_SWIZZLE:
+        lds_layout_wr =fx.make_ordered_layout((BLOCK_M, BLOCK_K), (1, 0))
+        lds_layout_rd = lds_layout_wr
+        # lds_layout_rd = fx.make_composed_layout(
+        #     fx.static(fx.SwizzleType.get(3, 3, 3)),
+        #     lds_layout_wr,
+        # )
     lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
     #LDS 0
@@ -107,6 +144,7 @@ def gemm_kernel(
     lds0_B_r_rd = fx.make_view(lds.lds0_b_r.ptr, lds_layout_rd)
     lds0_B_l_wr = fx.make_view(lds.lds0_b_l.ptr, lds_layout_wr)
     lds0_B_r_wr = fx.make_view(lds.lds0_b_r.ptr, lds_layout_wr)
+
 
     #LDS 1
     lds1_A_t_rd = fx.make_view(lds.lds1_a_t.ptr, lds_layout_rd)
@@ -186,6 +224,15 @@ def gemm_kernel(
     frag_C_bl = thr_mma.make_fragment_C(fx.select(bC_bl,[1,0]))
     frag_C_br = thr_mma.make_fragment_C(fx.select(bC_br,[1,0]))
     
+    print(f'##frag_A_t={frag_A_t}')
+    print(f'##frag_A_b={frag_A_b}')
+    print(f'##frag_B_l={frag_B_l}')
+    print(f'##frag_B_r={frag_B_r}')
+    
+    print(f'##frag_C_tl={frag_C_tl}')
+    print(f'##frag_C_tr={frag_C_tr}')
+    print(f'##frag_C_bl={frag_C_bl}')
+    print(f'##frag_C_br={frag_C_br}')
     # from LDS to reigster partition
     ldsA_rd_thread = s2r_tiled_copy_A.get_slice(tid)
     ldsB_rd_thread = s2r_tiled_copy_B.get_slice(tid)
@@ -243,60 +290,67 @@ def gemm_kernel(
         kiter = fx.Int32(kidx)
         
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest0_B_l)
         fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
         
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest0_A_t)
         fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest0_A_b)
         fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest0_B_r)
         fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
         
-        
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+3], ac_dest1_B_l)
         fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+3], ac_dest1_A_t)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
 
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+3], ac_dest1_A_b)
         fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
 
 
         rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
-        gpu.barrier()
+        wait_barrier(20)
+        # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
+        # gpu.barrier()
         fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+3], ac_dest1_B_r)
         fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)        
@@ -319,7 +373,6 @@ def gemm_kernel(
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
-
 
     fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
     fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
@@ -354,6 +407,7 @@ def gemm_kernel(
 
     fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
     fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+
     gpu.barrier()
 
     frag_C_tl = fx.select(frag_C_tl, [0, 2, 1])
@@ -377,14 +431,20 @@ def gemm_kernel(
     fx.copy(buffer_copy_atom_f32, src_frag_C_br, dst_C_br, pred=None)
 
 @flyc.jit
-def tiledMma(
+def launch_gemm(
     A: fx.Tensor,
     B: fx.Tensor,
     C: fx.Tensor,
     stream: fx.Stream = fx.Stream(None),
 ):
     
-    gemm_kernel(A, B, C).launch(grid=(M //(TILE_M), N // (TILE_N), 1), block=(256, 1, 1), stream=stream)
+    value_attrs = {"rocdl.waves_per_eu": 1,
+                "passthrough": [["amdgpu-agpr-alloc", "256,256"],]
+                }
+    A_2d = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M, K), (K, 1))))
+    B_2d = fx.Tensor(fx.make_view(fx.get_iter(B), fx.make_layout((N, K), (K, 1))))
+    C_2d = fx.Tensor(fx.make_view(fx.get_iter(C), fx.make_layout((M, N), (N, 1))))
+    gemm_kernel(A_2d, B_2d, C_2d, value_attrs=value_attrs,).launch(grid=(M //(TILE_M), N // (TILE_N), 1), block=(256, 1, 1), stream=stream)
 
 enable_dump_ir(True)
 assert BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "BLOCK_M, BLOCK_N, BLOCK_K must be 128, 128, 64"
@@ -392,14 +452,20 @@ A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 C = torch.zeros(M, N, dtype=torch.float32).cuda()
 expected = A.to(torch.float32) @ B.to(torch.float32).T
-tiledMma(A, B, C, stream=torch.cuda.Stream())
 
+hints = {
+    "opt_level" : 2,
+    "llvm_options": {"amdgpu-mfma-vgpr-form": False},
+}
+stream=torch.cuda.Stream()
+compiled_gemm = flyc.compile[hints](launch_gemm, A, B, C, stream)
+compiled_gemm(A, B, C, stream)
 torch.cuda.synchronize()
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 is_correct = torch.allclose(expected, C, atol=1e-5, rtol=1e-5)
 
-print("Result correct:", is_correct)
+print(f'{USE_SWIZZLE=} {is_correct=}')
 # if not is_correct:
 #     m_tiles = BLOCK_M // 32
 #     n_tiles = BLOCK_N // 32
