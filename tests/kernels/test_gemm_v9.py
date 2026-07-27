@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.compiler as flyc
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T, Vector
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 import os
 from flydsl._mlir.dialects import llvm as _llvm
 BLOCK_M = 128
@@ -18,12 +18,60 @@ TILE_N = BLOCK_N*2
 TILE_K = BLOCK_K*1
 M = TILE_M *16
 N = TILE_N*16
-K = TILE_K*8
+K = TILE_K*32
 if 0:
     M = TILE_M
     N = TILE_N
     K = TILE_K * 4
 
+from flydsl.expr.typing import Vector as Vec
+from flydsl._mlir.dialects import fly as fly_dialect
+from flydsl.expr.typing import T as _T
+
+class Mfma16x16x64:
+    def __init__(self, n_tiles_a, n_tiles_b):
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        # self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA(16, 16, 32, fx.BFloat16))
+        self.accum_type = Vec.make_type(4, fx.Float32)
+        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+
+    # def idx(self, i, j):
+    #     return i * self.n_tiles_b + j
+
+    # def _do_mma(self, a, b, c):
+    #     return fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a, b, c)
+    
+    def _do_mma(self, a, b, c):
+        # a, b, c are register-memref fragment slices; load them to vectors first.
+        a_i32x4 = vector.bitcast(_T.vec(4, _T.i32), a.load())
+        b_i32x4 = vector.bitcast(_T.vec(4, _T.i32), b.load())
+        c_vec = c.load()
+        res_ty = _T.vec(4, _T.f32)
+        return _llvm.inline_asm(
+            res_ty,
+            [arith._to_raw(a_i32x4), arith._to_raw(b_i32x4), arith._to_raw(c_vec)],
+            "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0",
+            "=a,v,v,0",
+            has_side_effects=True,
+        )
+
+    def call_BxA(self, a, b, c):
+        # assert len(a) == self.n_tiles_a
+        # assert len(b) == self.n_tiles_b
+        # assert len(c) == self.n_tiles_a * self.n_tiles_b
+
+        for i in range_constexpr(self.n_tiles_a):
+            for j in range_constexpr(self.n_tiles_b):
+                c[None, j, i] = self._do_mma(b[None, j, 0], a[None, i, 0], c[None, j, i])
+                c[None, j, i] = self._do_mma(b[None, j, 1], a[None, i, 1], c[None, j, i])
+
+        return c
+
+    # def call_one(self, a, b, c, i, j):
+    #     assert i < self.n_tiles_a and j < self.n_tiles_b
+    #     return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
@@ -31,6 +79,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 USE_SWIZZLE=_env_flag("SWIZZLE", "0")
+AGRP_GEMM=True
 PADDING_ELEMS = 16
 PADDING_NUM = PADDING_ELEMS * (16 - 1)
 if USE_SWIZZLE:
@@ -105,6 +154,7 @@ def gemm_kernel(
         # A =fx.make_view(fx.get_iter(A), GA_SWIZZLE_LAYOUT)
         # B =fx.make_view(fx.get_iter(B), GB_SWIZZLE_LAYOUT)
         
+
     bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 0, None]  # (BM, BK, k)
     bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 1, None]  # (BM, BK, k)
     bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y*2 + 0, None]  # (BN, BK, k)
@@ -251,11 +301,11 @@ def gemm_kernel(
     dest_frag_B_l = ldsB_rd_thread.retile(frag_B_l)
     dest_frag_B_r = ldsB_rd_thread.retile(frag_B_r)
 
-    # frag_C_tl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
-    # frag_C_tr.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
-    # frag_C_bl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
-    # frag_C_br.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
-    # acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+    frag_C_tl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_tr.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_bl.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    frag_C_br.store(Vector.filled(BLOCK_M * BLOCK_N // 64 // 4, 0, fx.Float32))
+    acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     
     rocdl.sched_barrier(0)
     fx.copy(async_copy_atom, ac_src_B_l[None, None, None, 0], ac_dest0_B_l)
@@ -288,19 +338,22 @@ def gemm_kernel(
     frag_C_tr.fill(0)
     frag_C_bl.fill(0)
     frag_C_br.fill(0)
-    # for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
-    for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
-        # frag_C_tl.store(states[0])
-        # frag_C_tr.store(states[1])
-        # frag_C_bl.store(states[2])
-        # frag_C_br.store(states[3])
-        # kiter = fx.Int32(kidx)
-        
+    rocdl.sched_barrier(0)
+
+    for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
+    # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
+        frag_C_tl.store(states[0])
+        frag_C_tr.store(states[1])
+        frag_C_bl.store(states[2])
+        frag_C_br.store(states[3])
+        kiter = fx.Int32(kidx)
+        mfma_agpr = Mfma16x16x64(4, 4)
         rocdl.sched_barrier(0)
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        # fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        mfma_agpr.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest0_B_l)
 
@@ -309,7 +362,8 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+        # fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+        mfma_agpr.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest0_A_t)
 
@@ -318,7 +372,9 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+        # fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+        mfma_agpr.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
+
         fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest0_A_b)
 
@@ -327,7 +383,8 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+        #fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+        mfma_agpr.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest0_B_r)
 
@@ -336,7 +393,8 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        #fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+        mfma_agpr.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+3], ac_dest1_B_l)
 
@@ -344,7 +402,8 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+        # fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+        mfma_agpr.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+3], ac_dest1_A_t)
 
@@ -352,27 +411,28 @@ def gemm_kernel(
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+        # fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+        mfma_agpr.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+3], ac_dest1_A_b)
-
-
 
         rocdl.sched_barrier(0)
         wait_barrier(20)
         # rocdl.s_waitcnt(_encode_waitcnt(vmcnt=20))
         # gpu.barrier()
-        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+        # fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+        mfma_agpr.call_BxA(frag_A_b, frag_B_r, frag_C_br)
+
         fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+3], ac_dest1_B_r)
 
         
-        # results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+        results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
-    # frag_C_tl.store(results[0])
-    # frag_C_tr.store(results[1])
-    # frag_C_bl.store(results[2])
-    # frag_C_br.store(results[3])
+    frag_C_tl.store(results[0])
+    frag_C_tr.store(results[1])
+    frag_C_bl.store(results[2])
+    frag_C_br.store(results[3])
 
     rocdl.sched_barrier(0)
     rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
@@ -380,45 +440,53 @@ def gemm_kernel(
         
 
     gpu.barrier()
-    fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    # fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    mfma_agpr.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
     fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
-    fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    # fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    mfma_agpr.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
     fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
-    fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+    # fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+    mfma_agpr.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
     fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
-    fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    # fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    mfma_agpr.call_BxA(frag_A_b, frag_B_r, frag_C_br)
     fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     gpu.barrier()
-    fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    # fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+    mfma_agpr.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
     fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
-    fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    # fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+    mfma_agpr.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
     fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
     rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
-    fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-    fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    # fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+    mfma_agpr.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
+    # fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+    mfma_agpr.call_BxA(frag_A_b, frag_B_r, frag_C_br)
 
     gpu.barrier()
 
