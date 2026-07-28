@@ -43,6 +43,14 @@ def hot_loop_scheduler_mainloop(group_id):
     rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
 
 
+def scheduler_epilog(group_id):
+    for _ in range_constexpr(8):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+    rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
+
+
+
 
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -241,6 +249,7 @@ def compile_gemm(
         A = fx.rocdl.make_buffer_tensor(A_2d,  max_size=False)
         B = fx.rocdl.make_buffer_tensor(B_2d,  max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d,  max_size=False)
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
 
         if lds_swizzle:
             num_base = 3
@@ -526,73 +535,140 @@ def compile_gemm(
         frag_C_bl.store(results[2])
         frag_C_br.store(results[3])
 
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
             
         mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
-        gpu.barrier()
+
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(0)
         rocdl.sched_barrier(0)
 
+        waitvmcnt_barrier(16)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(1)
         rocdl.sched_barrier(0)
 
+        waitvmcnt_barrier(12)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(2)
         rocdl.sched_barrier(0)
 
+        waitvmcnt_barrier(8)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(3)
         rocdl.sched_barrier(0)
 
-        gpu.barrier()
+        # epilogue store：提前建立 store 辅助，使其能与最后的 MFMA 交织，互相掩盖延迟。
+        if const_expr(permlane_epilogue):
+            # permlane 方式：两个相邻 16x16 tile 经 permlane16_swap 重排后，
+            # 每个 lane 一次 store 8 个连续 bf16（128-bit 合并写）。
+            # 注意：v9 的 C 寄存器->坐标映射由 c_tv_layout 决定，output-M 波是
+            # wave_id%2、output-N 波是 wave_id//2，与 950 kernel 相反。
+            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            lane_id = tid % 64
+            wave_id = tid // 64
+            wave_m = wave_id % 2
+            wave_n = wave_id // 2
+            lane_group = lane_id // 16
+            fragment_mode_0_repeat = TILE_N // 64
+            fragment_mode_1_repeat = TILE_M // 64
+
+            def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
+                for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        swap0 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d0_a),
+                            arith._to_raw(d0_b),
+                            False,
+                            False,
+                        )
+                        swap1 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d1_a),
+                            arith._to_raw(d1_b),
+                            False,
+                            False,
+                        )
+                        packed = Vec.from_elements(
+                            [
+                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
+                            ],
+                            fx.Int32,
+                        )
+                        row = (
+                            bid_x * TILE_M
+                            + quadrant_m * (TILE_M // 2)
+                            + row_repeat * 32
+                            + wave_m * 16
+                            + lane_id % 16
+                        )
+                        col = (
+                            bid_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 32
+                            + lane_group % 2 * 32
+                            + wave_n * 16
+                            + lane_group // 2 * 8
+                        )
+                        byte_offset = (row * N + col) * 2
+                        fx.buffer_ops.buffer_store(
+                            packed,
+                            c_store_rsrc,
+                            byte_offset,
+                            offset_is_bytes=True,
+                        )
+        else:
+            # 简单 bf16 存储：f32 累加器转 bf16，复用已验证正确的 tiled-copy C 布局。
+            store_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            tiled_copy_C_bf16 = fx.make_tiled_copy(store_atom_bf16, c_tv_layout, c_tile_mn)
+            thr_copy_C_bf16 = tiled_copy_C_bf16.get_slice(tid)
+
+            def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
+                c_sel = fx.select(c_frag, [0, 2, 1])
+                c_bf16 = fx.make_fragment_like(c_sel, dtype=fx.BFloat16)
+                c_bf16.store(c_sel.load().to(fx.BFloat16))
+                fx.copy(store_atom_bf16, thr_copy_C_bf16.retile(c_bf16), thr_copy_C_bf16.partition_D(bC))
+
+        waitvmcnt_barrier(4)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(4)
         rocdl.sched_barrier(0)
 
+        waitvmcnt_barrier(0)
+        # bl 的 FMA 与 tl 的存储互相掩盖
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        gpu.barrier()
+        scheduler_epilog(5)
+        store_quadrant(frag_C_tl, bC_tl, 0, 0)
         rocdl.sched_barrier(0)
 
+        # tr 的 FMA 掩盖 bl 的存储
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
+        store_quadrant(frag_C_bl, bC_bl, 1, 0)
+        rocdl.sched_barrier(0)
+
+        # br 的 FMA 掩盖 tr 的存储
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
+        store_quadrant(frag_C_tr, bC_tr, 0, 1)
+        rocdl.sched_barrier(0)
 
-        gpu.barrier()
-
-        frag_C_tl = fx.select(frag_C_tl, [0, 2, 1])
-        frag_C_tr = fx.select(frag_C_tr, [0, 2, 1])
-        frag_C_bl = fx.select(frag_C_bl, [0, 2, 1])
-        frag_C_br = fx.select(frag_C_br, [0, 2, 1])
-        
-        thr_copy_C = tiled_copy_C.get_slice(tid)
-        dst_C_tl = thr_copy_C.partition_D(bC_tl)
-        dst_C_tr = thr_copy_C.partition_D(bC_tr)
-        dst_C_bl = thr_copy_C.partition_D(bC_bl)
-        dst_C_br = thr_copy_C.partition_D(bC_br)
-        
-        src_frag_C_tl = thr_copy_C.retile(frag_C_tl)
-        src_frag_C_tr = thr_copy_C.retile(frag_C_tr)
-        src_frag_C_bl = thr_copy_C.retile(frag_C_bl)
-        src_frag_C_br = thr_copy_C.retile(frag_C_br)
-        fx.copy(buffer_copy_atom_f32, src_frag_C_tl, dst_C_tl, pred=None)
-        fx.copy(buffer_copy_atom_f32, src_frag_C_tr, dst_C_tr, pred=None)
-        fx.copy(buffer_copy_atom_f32, src_frag_C_bl, dst_C_bl, pred=None)
-        fx.copy(buffer_copy_atom_f32, src_frag_C_br, dst_C_br, pred=None)
+        # 最后 br 单独存储
+        store_quadrant(frag_C_br, bC_br, 1, 1)
 
     @flyc.jit
     def launch_gemm(
@@ -624,11 +700,17 @@ M = TILE_M *32
 N = TILE_N*32
 K = TILE_K*128
 USE_SWIZZLE=_env_flag("SWIZZLE", "0")
+# True: permlane 方式（一次 store 8 个 bf16）；False: 简单 bf16 tiled-copy 存储。两者都输出 bf16。
+PERMLANE_EPILOGUE = True
+OUT_DTYPE = torch.bfloat16
+OUT_ATOL = 0.03
+OUT_RTOL = 0.01
+OUT_BYTES = 2
 enable_dump_ir(True)
 # assert BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "BLOCK_M, BLOCK_N, BLOCK_K must be 128, 128, 64"
 A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-C = torch.zeros(M, N, dtype=torch.float32).cuda()
+C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
 expected = A.to(torch.float32) @ B.to(torch.float32).T
 
 hints = {
@@ -645,14 +727,14 @@ launcher_gemm = compile_gemm(TILE_M = 256,
     pin_bf16_agpr=True,
     lds_swizzle=USE_SWIZZLE,
     pid_swizzle=True,
-    permlane_epilogue=True)
+    permlane_epilogue=PERMLANE_EPILOGUE)
 
 compiled_gemm = flyc.compile[hints](launcher_gemm, A, B, C, M, stream)
 compiled_gemm(A, B, C, M, stream)
 torch.cuda.synchronize()
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-is_correct = torch.allclose(expected, C, atol=1e-5, rtol=1e-5)
+is_correct = torch.allclose(expected, C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL)
 
 print(f'{USE_SWIZZLE=} {is_correct=}')
 
@@ -661,7 +743,7 @@ import pyhip
 def compare_perf(run_count=16, data_clones=32):
     _A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
     _B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-    _C = torch.zeros(M, N, dtype=torch.float32).cuda()
+    _C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
 
     _hints = {"opt_level": 2, "llvm_options": {"amdgpu-mfma-vgpr-form": False}}
     _stream = torch.cuda.current_stream()
@@ -674,21 +756,21 @@ def compare_perf(run_count=16, data_clones=32):
         pin_bf16_agpr=True,
         lds_swizzle=USE_SWIZZLE,
         pid_swizzle=True,
-        permlane_epilogue=True)
+        permlane_epilogue=PERMLANE_EPILOGUE)
     _compiled = flyc.compile[_hints](launcher_gemm, _A, _B, _C, M, _stream)
 
     # accuracy
     _expected = _A.to(torch.float32) @ _B.to(torch.float32).T
     _compiled(_A, _B, _C, M, _stream)
     torch.cuda.synchronize()
-    acc = "pass" if torch.allclose(_expected, _C, atol=1e-5, rtol=1e-5) else "failed"
+    acc = "pass" if torch.allclose(_expected, _C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL) else "failed"
 
     As = [torch.randn(M, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
     Bs = [torch.randn(N, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
-    Cs = [torch.zeros(M, N, dtype=torch.float32).cuda() for _ in range(data_clones)]
+    Cs = [torch.zeros(M, N, dtype=OUT_DTYPE).cuda() for _ in range(data_clones)]
 
     flops = 2 * M * N * K
-    mem_bytes = (M * K + N * K) * 2 + M * N * 4  # bf16 A+B + float32 C
+    mem_bytes = (M * K + N * K) * 2 + M * N * OUT_BYTES  # bf16 A+B + C
 
     di = 0
     latencies = []
