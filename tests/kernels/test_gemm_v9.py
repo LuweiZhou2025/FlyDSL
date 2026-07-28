@@ -13,18 +13,34 @@ from flydsl._mlir.dialects import llvm as _llvm
 
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir.dialects import fly as fly_dialect
+from flydsl._mlir import ir
 from flydsl.expr.typing import T as _T
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-def hot_loop_scheduler_mainloop():
-    rocdl.sched_mfma(4)
+def anchor_frag(frag):
+    # 空 asm 延长 fragment 的 VGPR live range，防止后续 ds_read 过早复用仍被 MFMA
+    # 消费的寄存器而破坏交织（参照 test_gemm.py 的 anchor_b_frag）。
+    words = frag.load().bitcast(fx.Int32)
+    num_words = words.numel
+    result_type = ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * num_words)})>")
+    operands = [arith._to_raw(words[i]) for i in range_constexpr(num_words)]
+    constraints = ",".join(["=r"] * num_words + ["r"] * num_words)
+    _llvm.inline_asm(
+        result_type,
+        operands,
+        ";",
+        constraints,
+        has_side_effects=True,
+    )
+
+def hot_loop_scheduler_mainloop(group_id):
     for _ in range_constexpr(8):
-        rocdl.sched_dsrd(1)
-        rocdl.sched_mfma(1)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
     for _ in range_constexpr(4):
-        rocdl.sched_vmem(1)
-        rocdl.sched_mfma(4)
-    rocdl.sched_mfma(4)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
+    rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
 
 
 
@@ -215,7 +231,7 @@ def compile_gemm(
         # A_2d = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M, K), (K, 1))))
         # B_2d = fx.Tensor(fx.make_view(fx.get_iter(B), fx.make_layout((N, K), (K, 1))))
         # C_2d = fx.Tensor(fx.make_view(fx.get_iter(C), fx.make_layout((M, N), (N, 1))))
-        B_2d = fx.Tensor(fx.make_view(fx.get_iter(B), fx.make_layout((N, K), (K, 1))))
+        B_2d = fx.Tensor(fx.make_view(b_iter, fx.make_layout((N, K), (K, 1))))
         C_2d = fx.Tensor(fx.make_view(
             fx.get_iter(argC),
             fx.make_layout((M, N), (N, 1)),
@@ -362,15 +378,15 @@ def compile_gemm(
         frag_C_bl = thr_mma.make_fragment_C(fx.select(bC_bl,[1,0]))
         frag_C_br = thr_mma.make_fragment_C(fx.select(bC_br,[1,0]))
 
-        print(f'##frag_A_t={frag_A_t}')
-        print(f'##frag_A_b={frag_A_b}')
-        print(f'##frag_B_l={frag_B_l}')
-        print(f'##frag_B_r={frag_B_r}')
+        # print(f'##frag_A_t={frag_A_t}')
+        # print(f'##frag_A_b={frag_A_b}')
+        # print(f'##frag_B_l={frag_B_l}')
+        # print(f'##frag_B_r={frag_B_r}')
         
-        print(f'##frag_C_tl={frag_C_tl}')
-        print(f'##frag_C_tr={frag_C_tr}')
-        print(f'##frag_C_bl={frag_C_bl}')
-        print(f'##frag_C_br={frag_C_br}')
+        # print(f'##frag_C_tl={frag_C_tl}')
+        # print(f'##frag_C_tr={frag_C_tr}')
+        # print(f'##frag_C_bl={frag_C_bl}')
+        # print(f'##frag_C_br={frag_C_br}')
         # from LDS to reigster partition
         ldsA_rd_thread = s2r_tiled_copy_A.get_slice(tid)
         ldsB_rd_thread = s2r_tiled_copy_B.get_slice(tid)
@@ -430,77 +446,85 @@ def compile_gemm(
 
         wait_inline_asm = False
         mfma_inline_asm = True
-        # for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
-        for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
-            # frag_C_tl.store(states[0])
-            # frag_C_tr.store(states[1])
-            # frag_C_bl.store(states[2])
-            # frag_C_br.store(states[3])
-            # kiter = fx.Int32(kidx)
+        for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
+        # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
+            frag_C_tl.store(states[0])
+            frag_C_tr.store(states[1])
+            frag_C_bl.store(states[2])
+            frag_C_br.store(states[3])
+            kiter = fx.Int32(kidx)
             mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
 
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest0_B_l)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(0)
+            anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest0_A_t)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(1)
+            anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest0_A_b)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(2)
+            anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
         
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest0_B_r)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(3)
+            anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+3], ac_dest1_B_l)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(4)
+            anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+3], ac_dest1_A_t)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(5)
+            anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+3], ac_dest1_A_b)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(6)
+            anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
             
-            waitvmcnt_barrier(20)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
+            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+3], ac_dest1_B_r)
-            hot_loop_scheduler_mainloop()
+            hot_loop_scheduler_mainloop(7)
+            anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
 
-            # results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+            results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
         #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
-        # frag_C_tl.store(results[0])
-        # frag_C_tr.store(results[1])
-        # frag_C_bl.store(results[2])
-        # frag_C_br.store(results[3])
+        frag_C_tl.store(results[0])
+        frag_C_tr.store(results[1])
+        frag_C_bl.store(results[2])
+        frag_C_br.store(results[3])
 
         rocdl.sched_barrier(0)
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
@@ -620,10 +644,10 @@ launcher_gemm = compile_gemm(TILE_M = 256,
     dtype="bf16",
     pin_bf16_agpr=True,
     lds_swizzle=USE_SWIZZLE,
-    pid_swizzle=False,
+    pid_swizzle=True,
     permlane_epilogue=True)
 
-compiled_gemm = flyc.compile[hints](launcher_gemm, A, B, C, stream)
+compiled_gemm = flyc.compile[hints](launcher_gemm, A, B, C, M, stream)
 compiled_gemm(A, B, C, M, stream)
 torch.cuda.synchronize()
 
@@ -641,7 +665,17 @@ def compare_perf(run_count=16, data_clones=32):
 
     _hints = {"opt_level": 2, "llvm_options": {"amdgpu-mfma-vgpr-form": False}}
     _stream = torch.cuda.current_stream()
-    _compiled = flyc.compile[_hints](launcher_gemm, _A, _B, _C, _stream)
+    launcher_gemm = compile_gemm(TILE_M = 256,
+        TILE_N = 256,
+        TILE_K = 64,
+        N = N,
+        K = K,
+        dtype="bf16",
+        pin_bf16_agpr=True,
+        lds_swizzle=USE_SWIZZLE,
+        pid_swizzle=True,
+        permlane_epilogue=True)
+    _compiled = flyc.compile[_hints](launcher_gemm, _A, _B, _C, M, _stream)
 
     # accuracy
     _expected = _A.to(torch.float32) @ _B.to(torch.float32).T
