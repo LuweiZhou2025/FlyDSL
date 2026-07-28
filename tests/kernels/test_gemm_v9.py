@@ -16,9 +16,9 @@ BLOCK_K = 64
 TILE_M = BLOCK_M*2
 TILE_N = BLOCK_N*2
 TILE_K = BLOCK_K*1
-M = TILE_M *16
-N = TILE_N*16
-K = TILE_K*32
+M = TILE_M *32
+N = TILE_N*32
+K = TILE_K*128
 if 0:
     M = TILE_M
     N = TILE_N
@@ -29,15 +29,14 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl.expr.typing import T as _T
 
 def hot_loop_scheduler_mainloop():
-        rocdl.sched_mfma(6)
-        for _ in range_constexpr(8):
-            rocdl.sched_dsrd(1)
-            rocdl.sched_mfma(1)
+    rocdl.sched_mfma(4)
+    for _ in range_constexpr(8):
+        rocdl.sched_dsrd(1)
         rocdl.sched_mfma(1)
-        for _ in range_constexpr(4):
-            rocdl.sched_vmem(1)
-            rocdl.sched_mfma(4)
-        rocdl.sched_mfma(1)
+    for _ in range_constexpr(4):
+        rocdl.sched_vmem(1)
+        rocdl.sched_mfma(4)
+    rocdl.sched_mfma(4)
 
 
 
@@ -68,7 +67,7 @@ def enable_dump_ir(enable_debug_info=True):
         os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 
-def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
+def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
     """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
     vm_lo = vmcnt & 0xF
     vm_hi = (vmcnt >> 4) & 0x3
@@ -83,12 +82,11 @@ def wait_barrier(count):
         constraints="",
         has_side_effects=True,
     )
-def waitvmcnt_barrier(vmcnt, use_asm_inline = True):
-    if use_asm_inline:
-        wait_barrier(vmcnt)
-    else:
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt))
-        gpu.barrier()
+
+def waitvmcnt_barrier(vmcnt):
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
+        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+        rocdl.s_barrier()
 
 class Mfma16x16x64:
     def __init__(self, n_tiles_a, n_tiles_b, mma_atom, use_inline_asm=True):
@@ -114,15 +112,28 @@ class Mfma16x16x64:
             has_side_effects=False,
         )
 
-    def call_BxA(self, a, b, c):
+    def call_BxA(self, aa, bb, c):
         # assert len(a) == self.n_tiles_a
         # assert len(b) == self.n_tiles_b
         # assert len(c) == self.n_tiles_a * self.n_tiles_b
         if self.use_inline_asm:
-            for i in range_constexpr(self.n_tiles_a):
-                for j in range_constexpr(self.n_tiles_b):
-                    c[None, j, i] = self._do_mma(b[None, j, 0], a[None, i, 0], c[None, j, i])
-                    c[None, j, i] = self._do_mma(b[None, j, 1], a[None, i, 1], c[None, j, i])
+            """Use native K32 MFMA ops with explicit per-slice accumulator chains."""
+            for n in range_constexpr(self.n_tiles_b):
+                for m in range_constexpr(self.n_tiles_a):
+                    c_slice = c[None, n, m]
+                    acc = arith._to_raw(c_slice.load())
+                    for k in range_constexpr(2):
+                        a = bb[None, n, k].load()
+                        b = aa[None, m, k].load()
+                        acc = rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(4, T.f32),
+                            [arith._to_raw(a), arith._to_raw(b), arith._to_raw(acc), 0, 0, 0],
+                        )
+                    c_slice.store(acc)
+            # for i in range_constexpr(self.n_tiles_a):
+            #     for j in range_constexpr(self.n_tiles_b):
+            #         c[None, j, i] = self._do_mma(b[None, j, 0], a[None, i, 0], c[None, j, i])
+            #         c[None, j, i] = self._do_mma(b[None, j, 1], a[None, i, 1], c[None, j, i])
         else:
             fx.gemm(self.mma_atom, c, b, a, c)
 @fx.struct
@@ -135,6 +146,41 @@ class LDS_PADDING:
     lds1_a_b: fx.Array[BFloat16, BLOCK_M*BLOCK_K+PADDING_NUM, 16]
     lds1_b_l: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
     lds1_b_r: fx.Array[BFloat16, BLOCK_N*BLOCK_K+PADDING_NUM, 16]
+
+
+def div_up(x, y):
+    return (x + y - 1) // y
+
+def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
+    num_pid_m = (M + TILE_M - 1) // TILE_M
+    num_pid_n = div_up(N, TILE_N)
+
+    if const_expr(NUM_XCDS != 1):
+        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = GRID_MN % NUM_XCDS
+        tall_xcds = (tall_xcds == 0).select(NUM_XCDS, tall_xcds)
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+    if const_expr(GROUP_SIZE_M == 1):
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        remaining_pid_m = num_pid_m - first_pid_m
+        group_size_m = (remaining_pid_m < GROUP_SIZE_M).select(remaining_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    return pid_m, pid_n
+
+
 @flyc.kernel
 def gemm_kernel(
     A: fx.Tensor,
@@ -338,7 +384,7 @@ def gemm_kernel(
     fx.copy(async_copy_atom, ac_src_B_r[None, None, None, 1], ac_dest1_B_r)
     rocdl.sched_barrier(0)
     
-    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=24))
+    rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=24))
     gpu.barrier()
     fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
     fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
@@ -350,120 +396,120 @@ def gemm_kernel(
     frag_C_br.fill(0)
     rocdl.sched_barrier(0)
 
-    wait_inline_asm = True
+    wait_inline_asm = False
     mfma_inline_asm = True
-    for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
-    # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
-        frag_C_tl.store(states[0])
-        frag_C_tr.store(states[1])
-        frag_C_bl.store(states[2])
-        frag_C_br.store(states[3])
-        kiter = fx.Int32(kidx)
+    # for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
+    for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
+        # frag_C_tl.store(states[0])
+        # frag_C_tr.store(states[1])
+        # frag_C_bl.store(states[2])
+        # frag_C_br.store(states[3])
+        # kiter = fx.Int32(kidx)
         mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
 
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest0_B_l)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest0_A_t)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
         
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest0_A_b)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
     
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest0_B_r)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
         fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+3], ac_dest1_B_l)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
         
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
         fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+3], ac_dest1_A_t)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
         
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+3], ac_dest1_A_b)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
         
-        waitvmcnt_barrier(20,  wait_inline_asm)
+        waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+3], ac_dest1_B_r)
         hot_loop_scheduler_mainloop()
         rocdl.sched_barrier(0)
 
-        results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+        # results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
     #frag_C(val, n_rep, m_rep] -> frag_C[val, m_rep, n_rep]
-    frag_C_tl.store(results[0])
-    frag_C_tr.store(results[1])
-    frag_C_bl.store(results[2])
-    frag_C_br.store(results[3])
+    # frag_C_tl.store(results[0])
+    # frag_C_tr.store(results[1])
+    # frag_C_bl.store(results[2])
+    # frag_C_br.store(results[3])
 
     rocdl.sched_barrier(0)
-    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         
     mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
     gpu.barrier()
     mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
     fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
     fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
     fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
     fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     gpu.barrier()
     mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
     fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
     mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
     fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     gpu.barrier()
     rocdl.sched_barrier(0)
 
@@ -528,28 +574,6 @@ torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 is_correct = torch.allclose(expected, C, atol=1e-5, rtol=1e-5)
 
 print(f'{USE_SWIZZLE=} {is_correct=}')
-# if not is_correct:
-#     m_tiles = BLOCK_M // 32
-#     n_tiles = BLOCK_N // 32
-#     for i in range(m_tiles):
-#         base_m = i * 32
-#         for j in range(n_tiles):
-#             base_n = j * 32
-#             C00 = C[base_m:base_m+16, base_n:base_n+16]
-#             C01 = C[base_m:base_m+16, base_n+16:base_n+32]
-#             C10 = C[base_m+16:base_m+32, base_n:base_n+16]
-#             C11 = C[base_m+16:base_m+32, base_n+16:base_n+32]
-
-#             expected00 = expected[base_m:base_m+16, base_n:base_n+16]
-#             expected01 = expected[base_m:base_m+16, base_n+16:base_n+32]
-#             expected10 = expected[base_m+16:base_m+32, base_n:base_n+16]
-#             expected11 = expected[base_m+16:base_m+32, base_n+16:base_n+32]
-            
-#             print(f'#################base_m={base_m}, base_n={base_n}#####################')
-#             print(f'{C00=}\n, {expected00=}')
-#             print(f'{C01=}\n, {expected01=}')
-#             print(f'{C10=}\n, {expected10=}')
-#             print(f'{C11=}\n, {expected11=}')
 
 import pyhip
 
@@ -605,4 +629,4 @@ def compare_perf(run_count=16, data_clones=32):
     print(f"ratio: {torch_latencies[0]/best_ms:.2f}x")
 
 
-# compare_perf()
+compare_perf()
