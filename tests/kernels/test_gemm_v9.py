@@ -35,23 +35,27 @@ def anchor_frag(frag):
     )
 
 def hot_loop_scheduler_mainloop(group_id):
+
     for _ in range_constexpr(8):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
     for _ in range_constexpr(4):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
         rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
-    rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+    # 以 2 条 MFMA 为一组调度：同一 accumulator 的 k0/k1（真依赖链）落在同一组内
+    # 背靠背发射 -> 命中 GFXIPARCH-1380 suppression；组间穿插 ds_read / vmem 掩盖延迟。
+    for _ in range_constexpr(4):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
 
 
 def scheduler_epilog(group_id):
+    # 同样以 2 条 MFMA 为一组，保持 k0/k1 背靠背。
     for _ in range_constexpr(8):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
         rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
-    rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
-
-
-
+    for _ in range_constexpr(8):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
 
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
