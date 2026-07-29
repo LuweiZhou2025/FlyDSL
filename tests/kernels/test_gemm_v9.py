@@ -65,6 +65,20 @@ def scheduler_epilog(group_id):
     for _ in range_constexpr(12):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
 
+
+# VMEM_WRITE / VALU 掩码（flydsl 未导出 vmem_wr 常量，直接用 bit 值）。
+_MASK_VALU = 0x002
+_MASK_VMEM_WR = 0x040
+
+
+def scheduler_store_overlap(group_id):
+    # MFMA 领先：每发 4 条 MFMA，穿插 store 的 VALU(cvt/permlane) 与 buffer_store(vmem_wr)，
+    # 用 MFMA 计算掩盖 store 的写延迟（MFMA 必须领先，否则 store 会挡住计算流水）。
+    for _ in range_constexpr(8):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
+        rocdl.sched_group_barrier(_MASK_VALU, 6, group_id)
+        rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
+
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
@@ -675,19 +689,19 @@ def compile_gemm(
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
         store_quadrant(frag_C_tl, bC_tl, 0, 0)
-        # scheduler_epilog(5)
+        scheduler_store_overlap(5)
         rocdl.sched_barrier(0)
 
         # tr 的 FMA 掩盖 bl 的存储
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         store_quadrant(frag_C_bl, bC_bl, 1, 0)
-        # scheduler_epilog(6)
+        scheduler_store_overlap(6)
         rocdl.sched_barrier(0)
 
         # br 的 FMA 掩盖 tr 的存储
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         store_quadrant(frag_C_tr, bC_tr, 0, 1)
-        # scheduler_epilog(7)
+        scheduler_store_overlap(7)
         rocdl.sched_barrier(0)
 
         # 最后 br 单独存储
