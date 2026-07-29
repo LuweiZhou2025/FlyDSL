@@ -36,32 +36,38 @@ def anchor_frag(frag):
 
 def hot_loop_scheduler_mainloop(group_id):
 
-    for _ in range_constexpr(8):
+    for _ in range_constexpr(4):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    for _ in range_constexpr(8):
         rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
     for _ in range_constexpr(4):
         rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
     # 以 2 条 MFMA 为一组调度：同一 accumulator 的 k0/k1（真依赖链）落在同一组内
     # 背靠背发射 -> 命中 GFXIPARCH-1380 suppression；组间穿插 ds_read / vmem 掩盖延迟。
+    # for _ in range_constexpr(8):
+    #     rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
     for _ in range_constexpr(4):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
 
 
 def scheduler_epilog(group_id):
-    # 同样以 2 条 MFMA 为一组，保持 k0/k1 背靠背。
+    
+    for _ in range_constexpr(12):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
     for _ in range_constexpr(8):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
-    for _ in range_constexpr(8):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+    for _ in range_constexpr(12):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
 
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 
 def enable_dump_ir(enable_debug_info=True):
     if enable_debug_info:
@@ -668,18 +674,20 @@ def compile_gemm(
         # bl 的 FMA 与 tl 的存储互相掩盖
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-        scheduler_epilog(5)
         store_quadrant(frag_C_tl, bC_tl, 0, 0)
+        # scheduler_epilog(5)
         rocdl.sched_barrier(0)
 
         # tr 的 FMA 掩盖 bl 的存储
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         store_quadrant(frag_C_bl, bC_bl, 1, 0)
+        # scheduler_epilog(6)
         rocdl.sched_barrier(0)
 
         # br 的 FMA 掩盖 tr 的存储
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         store_quadrant(frag_C_tr, bC_tr, 0, 1)
+        # scheduler_epilog(7)
         rocdl.sched_barrier(0)
 
         # 最后 br 单独存储
@@ -697,9 +705,6 @@ def compile_gemm(
         value_attrs = {"rocdl.waves_per_eu": 1,
                     "passthrough": [["amdgpu-agpr-alloc", "256,256"],]
                     }
-        # A_2d = fx.Tensor(fx.make_view(fx.get_iter(A), fx.make_layout((M, K), (K, 1))))
-        # B_2d = fx.Tensor(fx.make_view(fx.get_iter(B), fx.make_layout((N, K), (K, 1))))
-        # C_2d = fx.Tensor(fx.make_view(fx.get_iter(C), fx.make_layout((M, N), (N, 1))))
         gemm_kernel(A, B, C, M, value_attrs=value_attrs,).launch(grid=(div_up(M, TILE_M)*div_up(N, TILE_N), 1, 1), block=(256, 1, 1), stream=stream)
         
     launch_gemm.compile_hints["llvm_options"] = {
