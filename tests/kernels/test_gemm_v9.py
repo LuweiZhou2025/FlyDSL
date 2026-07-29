@@ -16,6 +16,7 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir import ir
 from flydsl.expr.typing import T as _T
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from enum import Enum
 
 def anchor_frag(frag):
     # 空 asm 延长 fragment 的 VGPR live range，防止后续 ds_read 过早复用仍被 MFMA
@@ -96,36 +97,27 @@ def waitvmcnt_barrier(vmcnt):
         rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         rocdl.s_barrier()
 
+class MfmaMode(Enum):
+    # rocdl.mfma intrinsic，每个 c_slice 的 k0/k1 是两条独立指令，调度器可自由重排
+    # （通常把 k 提到外层、交织不同 accumulator 以掩盖 MFMA 依赖延迟）。
+    ROCDL = 0
+    # k0/k1 塞进同一条 inline_asm，强制两条 MFMA 背靠背复用同一 accumulator，
+    # 命中 GFXIPARCH-1380 的 SRCC/VDST read/write suppression。
+    INLINE_ASM_K2 = 1
+    # 交给 fx.gemm（tiled MMA）自行生成。
+    FX_GEMM = 2
+
+
 class Mfma16x16x64:
-    def __init__(self, n_tiles_a, n_tiles_b, mma_atom, use_inline_asm=True):
+    def __init__(self, n_tiles_a, n_tiles_b, mma_atom, mode=MfmaMode.ROCDL):
         self.mma_atom = mma_atom
-        # self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA(16, 16, 32, fx.BFloat16))
-        # self.accum_type = Vec.make_type(4, fx.Float32)
-        # self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
-        self.use_inline_asm = use_inline_asm
-    
-    def _do_mma(self, a, b, c):
-        # a, b, c are register-memref fragment slices; load them to vectors first.
-        a_i32x4 = vector.bitcast(_T.vec(4, _T.i32), a.load())
-        b_i32x4 = vector.bitcast(_T.vec(4, _T.i32), b.load())
-        c_vec = c.load()
-        res_ty = _T.vec(4, _T.f32)
-        return _llvm.inline_asm(
-            res_ty,
-            [arith._to_raw(a_i32x4), arith._to_raw(b_i32x4), arith._to_raw(c_vec)],
-            "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0",
-            "=a,v,v,0",
-            has_side_effects=False,
-        )
+        self.mode = mode
 
     def call_BxA(self, aa, bb, c):
-        # assert len(a) == self.n_tiles_a
-        # assert len(b) == self.n_tiles_b
-        # assert len(c) == self.n_tiles_a * self.n_tiles_b
-        if self.use_inline_asm:
-            """Use native K32 MFMA ops with explicit per-slice accumulator chains."""
+        if self.mode == MfmaMode.ROCDL:
+            # 每个 c_slice 独立发两条 k intrinsic，调度器自由重排。
             for n in range_constexpr(self.n_tiles_b):
                 for m in range_constexpr(self.n_tiles_a):
                     c_slice = c[None, n, m]
@@ -138,12 +130,32 @@ class Mfma16x16x64:
                             [arith._to_raw(a), arith._to_raw(b), arith._to_raw(acc), 0, 0, 0],
                         )
                     c_slice.store(acc)
-            # for i in range_constexpr(self.n_tiles_a):
-            #     for j in range_constexpr(self.n_tiles_b):
-            #         c[None, j, i] = self._do_mma(b[None, j, 0], a[None, i, 0], c[None, j, i])
-            #         c[None, j, i] = self._do_mma(b[None, j, 1], a[None, i, 1], c[None, j, i])
+        elif self.mode == MfmaMode.INLINE_ASM_K2:
+            # 把同一 accumulator 的 k0/k1 两条 MFMA 放进同一条 inline_asm，
+            # 调度器无法拆开 -> 背靠背复用 Matrix C/D，命中 GFXIPARCH-1380 suppression。
+            for n in range_constexpr(self.n_tiles_b):
+                for m in range_constexpr(self.n_tiles_a):
+                    c_slice = c[None, n, m]
+                    a0 = vector.bitcast(_T.vec(4, _T.i32), bb[None, n, 0].load())
+                    b0 = vector.bitcast(_T.vec(4, _T.i32), aa[None, m, 0].load())
+                    a1 = vector.bitcast(_T.vec(4, _T.i32), bb[None, n, 1].load())
+                    b1 = vector.bitcast(_T.vec(4, _T.i32), aa[None, m, 1].load())
+                    acc = c_slice.load()
+                    res = _llvm.inline_asm(
+                        _T.vec(4, _T.f32),
+                        [
+                            arith._to_raw(a0), arith._to_raw(b0),
+                            arith._to_raw(a1), arith._to_raw(b1),
+                            arith._to_raw(acc),
+                        ],
+                        "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0\n"
+                        "v_mfma_f32_16x16x32_bf16 $0, $3, $4, $0",
+                        "=a,v,v,v,v,0",
+                        has_side_effects=False,
+                    )
+                    c_slice.store(res)
         else:
-            fx.gemm(self.mma_atom, c, b, a, c)
+            fx.gemm(self.mma_atom, c, bb, aa, c)
 
 
 
@@ -161,6 +173,7 @@ def compile_gemm(
     lds_swizzle=False,
     pid_swizzle=False,
     permlane_epilogue=True,
+    mfma_mode=MfmaMode.ROCDL,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
@@ -453,8 +466,6 @@ def compile_gemm(
         frag_C_br.fill(0)
         rocdl.sched_barrier(0)
 
-        wait_inline_asm = False
-        mfma_inline_asm = True
         for kidx, states in range(0, K // BLOCK_K - 2, 2, init=acc_init):    
         # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
             frag_C_tl.store(states[0])
@@ -462,7 +473,7 @@ def compile_gemm(
             frag_C_bl.store(states[2])
             frag_C_br.store(states[3])
             kiter = fx.Int32(kidx)
-            mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
+            mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, mode=mfma_mode)
 
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
             waitvmcnt_barrier(20)
@@ -536,7 +547,7 @@ def compile_gemm(
         frag_C_br.store(results[3])
 
             
-        mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, use_inline_asm=mfma_inline_asm)
+        mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, mode=mfma_mode)
 
         waitvmcnt_barrier(20)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
@@ -567,7 +578,7 @@ def compile_gemm(
             # permlane 方式：两个相邻 16x16 tile 经 permlane16_swap 重排后，
             # 每个 lane 一次 store 8 个连续 bf16（128-bit 合并写）。
             # 注意：v9 的 C 寄存器->坐标映射由 c_tv_layout 决定，output-M 波是
-            # wave_id%2、output-N 波是 wave_id//2，与 950 kernel 相反。
+            # wave_id%2、output-N 波是 wave_id//2，
             pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
             lane_id = tid % 64
             wave_id = tid // 64
@@ -632,7 +643,7 @@ def compile_gemm(
                             offset_is_bytes=True,
                         )
         else:
-            # 简单 bf16 存储：f32 累加器转 bf16，复用已验证正确的 tiled-copy C 布局。
+            # 简单 bf16 存储：f32 累加器转 bf16，
             store_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
             tiled_copy_C_bf16 = fx.make_tiled_copy(store_atom_bf16, c_tv_layout, c_tile_mn)
             thr_copy_C_bf16 = tiled_copy_C_bf16.get_slice(tid)
@@ -702,6 +713,8 @@ K = TILE_K*128
 USE_SWIZZLE=_env_flag("SWIZZLE", "0")
 # True: permlane 方式（一次 store 8 个 bf16）；False: 简单 bf16 tiled-copy 存储。两者都输出 bf16。
 PERMLANE_EPILOGUE = True
+# MFMA 发射方式: ROCDL(调度器自由重排,k外提) / INLINE_ASM_K2(k0k1背靠背) / FX_GEMM
+MFMA_MODE = MfmaMode[os.environ.get("MFMA_MODE", "ROCDL")]
 OUT_DTYPE = torch.bfloat16
 OUT_ATOL = 0.03
 OUT_RTOL = 0.01
@@ -727,7 +740,8 @@ launcher_gemm = compile_gemm(TILE_M = 256,
     pin_bf16_agpr=True,
     lds_swizzle=USE_SWIZZLE,
     pid_swizzle=True,
-    permlane_epilogue=PERMLANE_EPILOGUE)
+    permlane_epilogue=PERMLANE_EPILOGUE,
+    mfma_mode=MFMA_MODE)
 
 compiled_gemm = flyc.compile[hints](launcher_gemm, A, B, C, M, stream)
 compiled_gemm(A, B, C, M, stream)
@@ -756,7 +770,8 @@ def compare_perf(run_count=16, data_clones=32):
         pin_bf16_agpr=True,
         lds_swizzle=USE_SWIZZLE,
         pid_swizzle=True,
-        permlane_epilogue=PERMLANE_EPILOGUE)
+        permlane_epilogue=PERMLANE_EPILOGUE,
+        mfma_mode=MFMA_MODE)
     _compiled = flyc.compile[_hints](launcher_gemm, _A, _B, _C, M, _stream)
 
     # accuracy
