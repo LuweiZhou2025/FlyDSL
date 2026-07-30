@@ -198,6 +198,7 @@ def compile_gemm(
     pid_swizzle=False,
     permlane_epilogue=True,
     mfma_mode=MfmaMode.ROCDL,
+    preshuffle_b=False,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
@@ -232,6 +233,7 @@ def compile_gemm(
         return pid_m, pid_n
     get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
+    # preshuffle B 可能会有一些padding的浪费
     PADDING_ELEMS = 16
     PADDING_NUM = PADDING_ELEMS * (16 - 1)
     if const_expr(lds_swizzle):
@@ -298,7 +300,10 @@ def compile_gemm(
         bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 0]  # (BM, BN)
         bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 1]  # (BM, BN)
 
-        #swizzle
+        ################################################################################################
+        ################################################################################################
+        ################read subA, subB tensor layout for padding, swizzle and B preshuffled case.######
+        #swizzle case:
         if const_expr(lds_swizzle):
             # swizzle 应用到静态形状的 tile 视图（而非 dynamic-M 的全局 A/B）：
             # 组合相同 num_shift 的 swizzle，形状全静态 -> layout-lowering 可正常 lower。
@@ -310,7 +315,7 @@ def compile_gemm(
             bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), fx.make_composed_layout(_sw, fx.get_layout(bA_b))))
             bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), fx.make_composed_layout(_sw, fx.get_layout(bB_l))))
             bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), fx.make_composed_layout(_sw, fx.get_layout(bB_r))))
-        #padding
+        #padding case:
         else:
             # A, B read layout
             bA_layout = fx.make_layout(((8, BLOCK_M//8), BLOCK_K, K//BLOCK_K), ((BLOCK_M//8*K, K), 1, BLOCK_K))
@@ -320,9 +325,21 @@ def compile_gemm(
             bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), bB_layout))
             bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), bB_layout))
 
-        # read and write LDS tensor view.
+        # preshuffle B case：，与 swizzle/padding 无关。
+        # 只在 preshuffle 时覆盖 bB_l/bB_r，A tensor 根据上面的padding和swizzle设置。
+        if const_expr(preshuffle_b):
+            _subB = fx.make_layout(((16, BLOCK_N//16), (8, BLOCK_K//8), K//BLOCK_K), ((8, 16*K), (1, 128), 1024))
+            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), _subB))
+            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), _subB))
+
+
+        ################################################################################################
+        ################################################################################################
+        ###################### rd/wr LDS tensor view for padding, swizzle and preshuffleB###############
+        #padding for rd and wr:
         lds_layout_rd =fx.make_layout(((16, 8), (32, 2)), ((512+PADDING_ELEMS, 64), (1, 32)))
         lds_layout_wr =fx.make_layout(((8, 16), 64), ((64, 8*64+PADDING_ELEMS), 1))
+        # read and write LDS tensor view for swizzle.
         if const_expr(lds_swizzle):
             lds_layout_wr =fx.make_ordered_layout((BLOCK_M, BLOCK_K), (1, 0))
             lds_layout_rd = lds_layout_wr
@@ -330,6 +347,16 @@ def compile_gemm(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
                 lds_layout_wr,
             )
+        #lds b rd/wr layout settting:
+        lds_layout_b_wr = lds_layout_wr
+        lds_layout_b_rd = lds_layout_rd
+        if const_expr(preshuffle_b):
+            _b_lds = fx.make_layout(((16, BLOCK_N//16), (8, BLOCK_K//8)), ((8, 1024), (1, 128)))
+            lds_layout_b_wr = _b_lds
+            lds_layout_b_rd = _b_lds
+            
+        ################################################################################################
+        ################################################################################################
         lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
         #LDS 0
@@ -337,10 +364,10 @@ def compile_gemm(
         lds0_A_b_rd = fx.make_view(lds.lds0_a_b.ptr, lds_layout_rd)
         lds0_A_t_wr = fx.make_view(lds.lds0_a_t.ptr, lds_layout_wr)
         lds0_A_b_wr = fx.make_view(lds.lds0_a_b.ptr, lds_layout_wr)
-        lds0_B_l_rd = fx.make_view(lds.lds0_b_l.ptr, lds_layout_rd)
-        lds0_B_r_rd = fx.make_view(lds.lds0_b_r.ptr, lds_layout_rd)
-        lds0_B_l_wr = fx.make_view(lds.lds0_b_l.ptr, lds_layout_wr)
-        lds0_B_r_wr = fx.make_view(lds.lds0_b_r.ptr, lds_layout_wr)
+        lds0_B_l_rd = fx.make_view(lds.lds0_b_l.ptr, lds_layout_b_rd)
+        lds0_B_r_rd = fx.make_view(lds.lds0_b_r.ptr, lds_layout_b_rd)
+        lds0_B_l_wr = fx.make_view(lds.lds0_b_l.ptr, lds_layout_b_wr)
+        lds0_B_r_wr = fx.make_view(lds.lds0_b_r.ptr, lds_layout_b_wr)
 
 
         #LDS 1
@@ -348,12 +375,14 @@ def compile_gemm(
         lds1_A_b_rd = fx.make_view(lds.lds1_a_b.ptr, lds_layout_rd)
         lds1_A_t_wr = fx.make_view(lds.lds1_a_t.ptr, lds_layout_wr)
         lds1_A_b_wr = fx.make_view(lds.lds1_a_b.ptr, lds_layout_wr)
-        lds1_B_l_rd = fx.make_view(lds.lds1_b_l.ptr, lds_layout_rd)
-        lds1_B_r_rd = fx.make_view(lds.lds1_b_r.ptr, lds_layout_rd)
-        lds1_B_l_wr = fx.make_view(lds.lds1_b_l.ptr, lds_layout_wr)
-        lds1_B_r_wr = fx.make_view(lds.lds1_b_r.ptr, lds_layout_wr)
+        lds1_B_l_rd = fx.make_view(lds.lds1_b_l.ptr, lds_layout_b_rd)
+        lds1_B_r_rd = fx.make_view(lds.lds1_b_r.ptr, lds_layout_b_rd)
+        lds1_B_l_wr = fx.make_view(lds.lds1_b_l.ptr, lds_layout_b_wr)
+        lds1_B_r_wr = fx.make_view(lds.lds1_b_r.ptr, lds_layout_b_wr)
         
-        # copy atoms
+        ################################################################################################
+        ################################################################################################
+        ######################## dma copy tiles ########################################################
         async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         lsd_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
         buffer_copy_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
@@ -364,21 +393,31 @@ def compile_gemm(
         ac_tv_layout =  fx.make_layout(((8, 8, 4), 8), ((8*4*8, 1, 8), 4*8))
         ac_tiled_copy = fx.make_tiled_copy(buffer_copy_atom_bf16, ac_tv_layout, ac_tile_mn)
         ac_thr = ac_tiled_copy.get_slice(tid)
-        # DMA copy partition src, dest
+        # preshuffle B 专属 tiled copy：tv=((16n,8k,2n),8k0):((1,256,16),32)，按 preshuffle 物理
+        # 连续排布 -> coalesced gather；非 preshuffle 时 B 沿用 ac_thr（padding 路径不变）。
+        if const_expr(preshuffle_b):
+            b_tv_layout = fx.make_layout(((16, 8, 2), 8), ((1, 256, 16), 32))
+            b_tiled_copy = fx.make_tiled_copy(buffer_copy_atom_bf16, b_tv_layout, fx.make_tile(32, 64))
+            b_thr = b_tiled_copy.get_slice(tid)
+        else:
+            b_thr = ac_thr
+        ################################################################################################
+        ################################################################################################
+        ######################## dma copy partition src/dest ###########################################
         ac_src_A_t = ac_thr.partition_S(bA_t)
         ac_src_A_b = ac_thr.partition_S(bA_b)
-        ac_src_B_l = ac_thr.partition_S(bB_l)
-        ac_src_B_r = ac_thr.partition_S(bB_r)
+        ac_src_B_l = b_thr.partition_S(bB_l)
+        ac_src_B_r = b_thr.partition_S(bB_r)
         #LDS0
         ac_dest0_A_t = ac_thr.partition_D(lds0_A_t_wr)
         ac_dest0_A_b = ac_thr.partition_D(lds0_A_b_wr)
-        ac_dest0_B_l = ac_thr.partition_D(lds0_B_l_wr)
-        ac_dest0_B_r = ac_thr.partition_D(lds0_B_r_wr)
+        ac_dest0_B_l = b_thr.partition_D(lds0_B_l_wr)
+        ac_dest0_B_r = b_thr.partition_D(lds0_B_r_wr)
         #LDS1
         ac_dest1_A_t = ac_thr.partition_D(lds1_A_t_wr)
         ac_dest1_A_b = ac_thr.partition_D(lds1_A_b_wr)
-        ac_dest1_B_l = ac_thr.partition_D(lds1_B_l_wr)
-        ac_dest1_B_r = ac_thr.partition_D(lds1_B_r_wr)
+        ac_dest1_B_l = b_thr.partition_D(lds1_B_l_wr)
+        ac_dest1_B_r = b_thr.partition_D(lds1_B_r_wr)
 
         # tiled MMA, thread MMA
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
@@ -389,10 +428,7 @@ def compile_gemm(
         s2r_tiled_copy_A = fx.make_tiled_copy_A(buffer_copy_atom_bf16, tiled_mma)
         s2r_tiled_copy_B = fx.make_tiled_copy_B(buffer_copy_atom_bf16, tiled_mma)
         # C tiled copy. make_tiled_copy_C is not used because C= B*A
-        c_tile_mn = fx.make_tile(32, 32)
-        # wave ((2, 2, 1), (1, 2, 0)):
-        c_tv_layout =  fx.make_layout((((16, 4), 2, 2), 4), (((1, 128), 16, 512) , 32))   
-        tiled_copy_C = fx.make_tiled_copy(buffer_copy_atom_f32, c_tv_layout, c_tile_mn)
+  
         #MMA fragments
         #fragA layout:((a_val), m_rep, k_rep)
         #fragB layout:((b_val), n_rep, k_rep)
@@ -475,7 +511,7 @@ def compile_gemm(
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, 1], ac_dest1_B_r)
         rocdl.sched_barrier(0)
         
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=24))
+        waitvmcnt_barrier(24)
         gpu.barrier()
         fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
@@ -665,6 +701,9 @@ def compile_gemm(
                         )
         else:
             # 简单 bf16 存储：f32 累加器转 bf16，
+            c_tile_mn = fx.make_tile(32, 32)
+            # wave ((2, 2, 1), (1, 2, 0)):
+            c_tv_layout =  fx.make_layout((((16, 4), 2, 2), 4), (((1, 128), 16, 512) , 32)) 
             store_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
             tiled_copy_C_bf16 = fx.make_tiled_copy(store_atom_bf16, c_tv_layout, c_tile_mn)
             thr_copy_C_bf16 = tiled_copy_C_bf16.get_slice(tid)
@@ -735,6 +774,14 @@ USE_SWIZZLE=_env_flag("SWIZZLE", "0")
 PERMLANE_EPILOGUE = True
 # MFMA 发射方式: ROCDL(调度器自由重排,k外提) / INLINE_ASM_K2(k0k1背靠背) / FX_GEMM
 MFMA_MODE = MfmaMode[os.environ.get("MFMA_MODE", "ROCDL")]
+# preshuffle B: host 端把 B 预 shuffle 成 MFMA 友好布局；kernel 内 B 无需 swizzle/padding。
+PRESHUFFLE_B = _env_flag("PRESHUFFLE_B", "0")
+if PRESHUFFLE_B:
+    import sys as _sys, os.path as _osp
+    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
+    if _flydsl_root not in _sys.path:
+        _sys.path.insert(0, _flydsl_root)
+    from tests.utils import shuffle_weight
 OUT_DTYPE = torch.bfloat16
 OUT_ATOL = 0.03
 OUT_RTOL = 0.01
@@ -745,6 +792,8 @@ A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
 C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
 expected = A.to(torch.float32) @ B.to(torch.float32).T
+# preshuffle 时喂给 kernel 的是 shuffle 后的 B；expected 仍用原始 B。
+weight = shuffle_weight(B, layout=(16, 16)) if PRESHUFFLE_B else B
 
 hints = {
     "opt_level" : 2,
@@ -761,16 +810,17 @@ launcher_gemm = compile_gemm(TILE_M = 256,
     lds_swizzle=USE_SWIZZLE,
     pid_swizzle=True,
     permlane_epilogue=PERMLANE_EPILOGUE,
-    mfma_mode=MFMA_MODE)
+    mfma_mode=MFMA_MODE,
+    preshuffle_b=PRESHUFFLE_B)
 
-compiled_gemm = flyc.compile[hints](launcher_gemm, A, B, C, M, stream)
-compiled_gemm(A, B, C, M, stream)
+compiled_gemm = flyc.compile[hints](launcher_gemm, A, weight, C, M, stream)
+compiled_gemm(A, weight, C, M, stream)
 torch.cuda.synchronize()
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 is_correct = torch.allclose(expected, C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL)
 
-print(f'{USE_SWIZZLE=} {is_correct=}')
+print(f'{PRESHUFFLE_B=} {USE_SWIZZLE=} {is_correct=}')
 
 import pyhip
 
@@ -791,17 +841,21 @@ def compare_perf(run_count=16, data_clones=32):
         lds_swizzle=USE_SWIZZLE,
         pid_swizzle=True,
         permlane_epilogue=PERMLANE_EPILOGUE,
-        mfma_mode=MFMA_MODE)
-    _compiled = flyc.compile[_hints](launcher_gemm, _A, _B, _C, M, _stream)
+        mfma_mode=MFMA_MODE,
+        preshuffle_b=PRESHUFFLE_B)
+    _weight = shuffle_weight(_B, layout=(16, 16)) if PRESHUFFLE_B else _B
+    _compiled = flyc.compile[_hints](launcher_gemm, _A, _weight, _C, M, _stream)
 
     # accuracy
     _expected = _A.to(torch.float32) @ _B.to(torch.float32).T
-    _compiled(_A, _B, _C, M, _stream)
+    _compiled(_A, _weight, _C, M, _stream)
     torch.cuda.synchronize()
     acc = "pass" if torch.allclose(_expected, _C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL) else "failed"
 
     As = [torch.randn(M, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
     Bs = [torch.randn(N, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
+    if PRESHUFFLE_B:
+        Bs = [shuffle_weight(_b, layout=(16, 16)) for _b in Bs]
     Cs = [torch.zeros(M, N, dtype=OUT_DTYPE).cuda() for _ in range(data_clones)]
 
     flops = 2 * M * N * K
