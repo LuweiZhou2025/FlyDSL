@@ -234,7 +234,7 @@ def compile_gemm(
 
     PADDING_ELEMS = 16
     PADDING_NUM = PADDING_ELEMS * (16 - 1)
-    if lds_swizzle:
+    if const_expr(lds_swizzle):
         PADDING_NUM = 0
     @fx.struct
     class LDS_PADDING:
@@ -288,23 +288,6 @@ def compile_gemm(
         C = fx.rocdl.make_buffer_tensor(C_2d,  max_size=False)
         c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
 
-        if lds_swizzle:
-            num_base = 3
-            num_bits = 3
-            num_shift = K.bit_length() - 1 - num_base 
-            
-            GA_SWIZZLE_LAYOUT = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 3, num_shift)),
-                fx.get_layout(A),
-            )
-            GB_SWIZZLE_LAYOUT = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 3, num_shift)),
-                fx.get_layout(B),
-            )
-            # A =fx.make_view(fx.get_iter(A), GA_SWIZZLE_LAYOUT)
-            # B =fx.make_view(fx.get_iter(B), GB_SWIZZLE_LAYOUT)
-            
-
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 0, None]  # (BM, BK, k)
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x*2 + 1, None]  # (BM, BK, k)
         bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y*2 + 0, None]  # (BN, BK, k)
@@ -314,7 +297,21 @@ def compile_gemm(
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 0, bid_y*2 + 1]  # (BM, BN)
         bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 0]  # (BM, BN)
         bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x*2 + 1, bid_y*2 + 1]  # (BM, BN)
-        if not lds_swizzle:
+
+        #swizzle
+        if const_expr(lds_swizzle):
+            # swizzle 应用到静态形状的 tile 视图（而非 dynamic-M 的全局 A/B）：
+            # 组合相同 num_shift 的 swizzle，形状全静态 -> layout-lowering 可正常 lower。
+            # M 是 runtime 值，若组合到全局 A((M,K)) 会因动态 extent 无法 lower。
+            # num_shift 仅依赖 K（编译期常量），分支 scope 隔离，故在此就地计算。
+            _num_shift = K.bit_length() - 1 - 3
+            _sw = fx.static(fx.SwizzleType.get(3, 3, _num_shift))
+            bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), fx.make_composed_layout(_sw, fx.get_layout(bA_t))))
+            bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), fx.make_composed_layout(_sw, fx.get_layout(bA_b))))
+            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), fx.make_composed_layout(_sw, fx.get_layout(bB_l))))
+            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), fx.make_composed_layout(_sw, fx.get_layout(bB_r))))
+        #padding
+        else:
             # A, B read layout
             bA_layout = fx.make_layout(((8, BLOCK_M//8), BLOCK_K, K//BLOCK_K), ((BLOCK_M//8*K, K), 1, BLOCK_K))
             bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), bA_layout))
@@ -326,13 +323,13 @@ def compile_gemm(
         # read and write LDS tensor view.
         lds_layout_rd =fx.make_layout(((16, 8), (32, 2)), ((512+PADDING_ELEMS, 64), (1, 32)))
         lds_layout_wr =fx.make_layout(((8, 16), 64), ((64, 8*64+PADDING_ELEMS), 1))
-        if lds_swizzle:
+        if const_expr(lds_swizzle):
             lds_layout_wr =fx.make_ordered_layout((BLOCK_M, BLOCK_K), (1, 0))
             lds_layout_rd = lds_layout_wr
-            # lds_layout_rd = fx.make_composed_layout(
-            #     fx.static(fx.SwizzleType.get(3, 3, 3)),
-            #     lds_layout_wr,
-            # )
+            lds_layout_rd = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                lds_layout_wr,
+            )
         lds = fx.SharedAllocator().allocate(LDS_PADDING).peek()
 
         #LDS 0
