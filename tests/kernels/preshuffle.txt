@@ -1,0 +1,81 @@
+
+
+#preshuffle layout
+preshuffle B(N, K) layout is 
+
+(N//16, K // 32, 4k, 16n, 8k)
+(K*16,  512,     128, 8,   1)
+
+假设BN=128， BK = 64 for bf16 type.
+
+每一次DMA需要copy [BN, BK] data into LDS, 这些会均分给256个线程，每个线程copy 8个元素。我们看看[BN, BK]这些元素在layout中的stide
+
+
+(N//16, K // 32, 4k, 16n, 8k) ->
+(N//BN, BN // 16, K // BK,  BK//32, 4k, 16n, 8k) -> 
+(N//128, 8n,   K//64, 2k, 4k, 16n, 8k)  合并2k x4k ->
+
+(N//128, 8n,   K//64, 8k, 16n, 8k), strides:
+(128*K,  16*K,  1024, 128, 8, 1 )
+
+
+这个stride我们先放在这里，后面再描述layout的时候，需要根据对应的mode做一下变化。
+
+# copy tile:
+
+现在需要考虑的是的是copy tile，
+copy tile对应的大小是,4个wave, 256*8 = 2048个element.尽量的连续copy,
+
+以[128n, 64k]作为一次fx.copy到DMA里的单位， 在(N//128, 8n, K//64, 8k, 16n, 8k), slice出[BN, BK] layout:
+(8n, 8k, 16n, 8k) , (16*K, 128, 8, 1) , tilecopy的尺寸是只256个thread copy的n, k的值，
+可以看出有128 thread可以在物理连续上copy(4k, 16n, 8k) ,其余的128 thread需要在8n上分，
+
+(8n, 8k, 16n, 8k) -> (4n, 2n, 8k, 16n, 8k), 256个thread copy 的tile大小是(2n, 8k, 16n, 8k) 即（32n, 64k）
+
+一个tile的layout是：
+(4n,  2n,  8k, 16n, 8k):
+(32*K,16*K, 128, 8, 1)
+
+这个tile copy的thread value layout, 一共有256个thread, 按照尽量连续copy,我们先来排thread, value， 然后在根据是在M, K的sub mode维度计算stride.
+256个threads, 8个value, 按照上面的layout, 连续thread访问来开始排放
+(256, 8) -> ((128, 2), 8) -> ((16, 8, 2) , 8value)  这里对应的 k, n mode,
+
+ ((16,   8,  2) , 8value) ， 对应的mode:
+ ((16n,  8k, 2n), 8k) 
+
+根据mode就可以计算出stride,这个stride是N major， tile尺寸是(32n, 64k), 所以K维度的stride是32，
+
+ ((16,   8,   2) ,  8value) 
+ ((16n,  8k,  2n),  8k) stride是：
+ ((1,   8*32, 16), 32) 
+
+所以tile thread value layout 是((16, 8, 2) , 8):((1, 256, 16), 32), tile is (32, 64)
+
+# B layout:
+现在需要描述一下sub B tensor的layout,之前的这个B preshuffle之后的layout 分解：
+
+(N//128, 8n,   K//64, 8k, 16n, 8k), strides:
+(128*K,  16*K,  1024, 128, 8, 1 )
+
+
+subB tensor 是（BN, BK, Kiter）->(128n, 64K, K//64)， 
+
+分解BN 维度， tile Size是32n, 是否凑出32??好像不需要：
+128n -> (16, 8):(8， 16*K)
+
+分解BK维度：
+64k -> (8, 8):(1, 128)
+
+K iter 维度：
+(K//64) : (1024)
+
+((16, 8), (8, 8), K // 64):((8， 16*K), (1, 128), 1024)
+
+#LDS layout:
+ LDS layout可以根据[BN, BK]在subtensor中的layout改动，
+
+SubB, [BN, BK]
+ (8n,  8k, 16n, 8k), strides:(16*K, 128, 8, 1 ), 8n mode stride只需要改成连续就可以了 ， (BN, BK)在LDS中连续，所以
+ LDS （8n, 8k, 16n, 8k）, (1024 ，128， 8， 1)
+
+按照（N， K）就是(16, 8), (8, 8): (8, 1024), (1, 128)
