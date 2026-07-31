@@ -51,18 +51,22 @@ def waitvmcnt_barrier(vmcnt):
 
 
 def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
-    
+    # 对标 gemm_4wave_950：把 DSRD 与 VMEM 都按实际数量均匀铺在 16 条 MFMA 上，
+    # 而非把 DSRD 全部前置、VMEM 全部后置。均匀交织让 global load 更早发射并分散，
+    # 改善访存延迟隐藏（前置/后置写法在 8192^3 上落后参考实现约 1.8%）。
     total_mfmas = 16
-    remaing_mfmas = total_mfmas - vmem_ops*2 - dsrd_ops
-    for _ in range_constexpr(dsrd_ops):
+    prev_dsrd = 0
+    prev_vmem = 0
+    for i in range_constexpr(total_mfmas):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
-    for _ in range_constexpr(vmem_ops):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    for _ in range_constexpr(remaing_mfmas):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        cur_dsrd = ((i + 1) * dsrd_ops + total_mfmas - 1) // total_mfmas
+        cur_vmem = ((i + 1) * vmem_ops + total_mfmas - 1) // total_mfmas
+        if const_expr(cur_dsrd > prev_dsrd):
+            rocdl.sched_group_barrier(rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id)
+        if const_expr(cur_vmem > prev_vmem):
+            rocdl.sched_group_barrier(rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id)
+        prev_dsrd = cur_dsrd
+        prev_vmem = cur_vmem
 
 
 # VMEM_WRITE / VALU 掩码（flydsl 未导出 vmem_wr 常量，直接用 bit 值）。
@@ -240,8 +244,16 @@ def compile_gemm_fp8(
             )
             dma = fx.make_tiled_copy(buffer_copy_atom, _g2s_tv, _g2s_tile).get_slice(tid)
         else:
-            _wr = fx.make_layout(((8, 16), BLOCK_K), ((BLOCK_K, A_GROUP), 1))
-            _rd = fx.make_layout(((16, 8), (32, BLOCK_K // 32)), ((A_GROUP, BLOCK_K), (1, 32)))
+            # A: fp8 kWidth=32 双层 padding（对标 gemm_4wave_950：[[1024,16],[2048,32]]），
+            # 消除 MFMA_Scale A operand 读的 LDS bank conflict（单层 [[1024,32]] 无法清零）。
+            _wr = fx.make_layout(
+                ((8, 2, BLOCK_M // 16), BLOCK_K),
+                ((BLOCK_K, 8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32), 1),
+            )
+            _rd = fx.make_layout(
+                ((2, BLOCK_M // 16, 8), (32, BLOCK_K // 32)),
+                ((8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32, BLOCK_K), (1, 32)),
+            )
             _a_dma_tv = fx.make_layout(
                 ((8, 8, 4), elements_per_128b),
                 ((elements_per_128b * 32, 1, 8), 32),
@@ -345,7 +357,15 @@ def compile_gemm_fp8(
         rocdl.sched_barrier(0)
         acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
 
-        # ---- 主循环（对标 gemm_v9：单份 fragment，一次迭代吃 2 个 k-tile = 8 个 region）----
+        # 每 region 的 ds_read / vmem 计数（对标 gemm_4wave_950）：A operand 与 B operand
+        # 的 fragment 大小不同，ds_read_b128 数量也不同；读 A 的 region 用 a_dsrd，读 B 的用
+        # b_dsrd。之前对所有 region 统一传 dsrd=8，导致读 B 的 region 未被完整调度、访存交织
+        # 退化并增加 wait cycles。
+        a_dsrd = frag_A_t.load().numel * element_type.width // 8 // 16
+        b_dsrd = frag_B_l.load().numel * element_type.width // 8 // 16
+        a_vmem = (BLOCK_M * BLOCK_K * element_type.width // 8) // (256 * 16)
+        b_vmem = (BLOCK_N * BLOCK_K * element_type.width // 8) // (256 * 16)
+
         # 每个 region：1 个象限 fx.gemm(C=B*A) + 下一 operand 的 s2r + 再下一块的 g2s，
         # 用 s2r_src0_*/s2r_src1_* 在 LDS buf0/buf1 之间 ping-pong；每个 slice 顺序与 gemm_v9 一致。
         # k-tile 内 4 个象限的顺序固定为：tl(A_t·B_l) -> bl(A_b·B_l) -> tr(A_t·B_r) -> br(A_b·B_r)。
@@ -361,61 +381,61 @@ def compile_gemm_fp8(
             kiter = fx.Int32(kidx)
 
             # ---- k-tile = buf0：4 象限 ----
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            hot_loop_scheduler_mainloop(0, 4, 8)
+            hot_loop_scheduler_mainloop(0, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            hot_loop_scheduler_mainloop(1, 4, 8)
+            hot_loop_scheduler_mainloop(1, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            hot_loop_scheduler_mainloop(2, 4, 8)
+            hot_loop_scheduler_mainloop(2, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
-            hot_loop_scheduler_mainloop(3, 4, 8)
+            hot_loop_scheduler_mainloop(3, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
             # ---- k-tile = buf1：4 象限 ----
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            hot_loop_scheduler_mainloop(4, 4, 8)
+            hot_loop_scheduler_mainloop(4, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            hot_loop_scheduler_mainloop(5, 4, 8)
+            hot_loop_scheduler_mainloop(5, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            hot_loop_scheduler_mainloop(6, 4, 8)
+            hot_loop_scheduler_mainloop(6, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(20)
             fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
-            hot_loop_scheduler_mainloop(7, 4, 8)
+            hot_loop_scheduler_mainloop(7, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
             results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
