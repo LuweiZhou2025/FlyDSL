@@ -65,6 +65,20 @@ def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
 
 
+# VMEM_WRITE / VALU 掩码（flydsl 未导出 vmem_wr 常量，直接用 bit 值）。
+_MASK_VALU = 0x002
+_MASK_VMEM_WR = 0x040
+
+
+def scheduler_store_overlap(group_id):
+    # MFMA 领先：每 2 条 MFMA 穿插 store 的 VALU(cvt/permlane) 与 buffer_store(vmem_wr)，
+    # 用 MFMA 计算掩盖 store 的写延迟（fp8 每象限 16 条 MFMA、8 次 buffer_store）。
+    # MFMA 必须领先，否则 store 会挡住计算流水。
+    for _ in range_constexpr(8):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        rocdl.sched_group_barrier(_MASK_VALU, 6, group_id)
+        rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
+
 
 def compile_gemm_fp8(
     TILE_M,
@@ -74,15 +88,15 @@ def compile_gemm_fp8(
     K,
     pid_swizzle=True,
     lds_swizzle=False,
+    preshuffle_b=False,
+    permlane_epilogue=True,
+    store_overlap=False,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
-    # 主循环 vmcnt 阈值：fp8 数据量与 bf16 一致（fp8 1B×BLOCK_K128 == bf16 2B×BLOCK_K64），
-    # 每块/每 array 的 128b buffer_load 条数与 bf16 相同，故 vmcnt 直接对标 bf16 gemm_v9 = 20。
-    _VMCNT = int(os.environ.get("VMCNT", "20"))
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
     # fp8 每象限一条 MFMA(16x16x128) 抵 bf16 两条(16x16x32)，故 MFMA 计数减半（32->16）；
     # ds_read/vmem 计数不变（数据量一致）。仅在完整流水迭代（同时有 s2r+g2s）时应用。
@@ -152,6 +166,7 @@ def compile_gemm_fp8(
         A = fx.rocdl.make_buffer_tensor(A_2d, max_size=False)
         B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
 
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
@@ -179,6 +194,18 @@ def compile_gemm_fp8(
             )
             bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), b_grouped))
             bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), b_grouped))
+
+        # preshuffle B：host 端已 shuffle_weight(B, layout=(16,64))，kernel 用 subB 再视图
+        # 从 flat_divide 的 tile base 恢复 logical (n,k) -> shuffled 物理偏移（与 swizzle/padding 无关）。
+        # subB 形状 ((ni16, nb=BLOCK_N//16), (k0=16, k1=BLOCK_K//16), k_tile)，
+        # 步长 ((16, 16*K), (1, 256), 2048) 对应 shuffle 存储顺序 (nb,kb,k1,ni,k0)。
+        if const_expr(preshuffle_b):
+            _subB = fx.make_layout(
+                ((16, BLOCK_N // 16), (16, BLOCK_K // 16), K // BLOCK_K),
+                ((16, 16 * K), (1, 256), 2048),
+            )
+            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), _subB))
+            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), _subB))
 
         bC_tl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 0, bid_y * 2 + 0]
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 0, bid_y * 2 + 1]
@@ -221,23 +248,41 @@ def compile_gemm_fp8(
             )
             dma = fx.make_tiled_copy(buffer_copy_atom, _a_dma_tv, fx.make_tile(32, BLOCK_K)).get_slice(tid)
 
+        # B 的 LDS wr/rd：preshuffle 时用与 shuffle 一致的无 bank-conflict 布局（wr==rd），
+        # 否则沿用与 A 相同的 _wr/_rd。仅 CORRECTNESS 需 subB 正确 + LDS 为任意双射；DMA tv 只影响性能。
+        _wr_b = _wr
+        _rd_b = _rd
+        if const_expr(preshuffle_b):
+            _b_lds = fx.make_layout(((16, BLOCK_N // 16), (16, BLOCK_K // 16)), ((16, 2048), (1, 256)))
+            _wr_b = _b_lds
+            _rd_b = _b_lds
+
+        # B 专属 DMA：preshuffle 时 subB 的嵌套形状与 padding dma 不匹配，需独立 tiled_copy。
+        # 手工 tv：每线程沿 k0(=16 连续 fp8=128b) 合并 load，n=ni(16)+16*half(2)，k=16*kblk(8)+kv(16)。
+        # 对标 bf16 的 ((16,8,2),8),((1,256,16),32) tile(32,64)；fp8 value 16、kblk 步 512、tile(32,128)。
+        if const_expr(preshuffle_b):
+            _b_g2s_tv = fx.make_layout(((16, 8, 2), elements_per_128b), ((1, 512, 16), 32))
+            dma_b = fx.make_tiled_copy(buffer_copy_atom, _b_g2s_tv, fx.make_tile(32, BLOCK_K)).get_slice(tid)
+        else:
+            dma_b = dma
+
         sA_t_wr = [fx.make_view(lds.a_t0.ptr, _wr), fx.make_view(lds.a_t1.ptr, _wr)]
         sA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
         sA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
         sA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
-        sB_l_wr = [fx.make_view(lds.b_l0.ptr, _wr), fx.make_view(lds.b_l1.ptr, _wr)]
-        sB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr), fx.make_view(lds.b_r1.ptr, _wr)]
-        sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd), fx.make_view(lds.b_l1.ptr, _rd)]
-        sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd), fx.make_view(lds.b_r1.ptr, _rd)]
+        sB_l_wr = [fx.make_view(lds.b_l0.ptr, _wr_b), fx.make_view(lds.b_l1.ptr, _wr_b)]
+        sB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr_b), fx.make_view(lds.b_r1.ptr, _wr_b)]
+        sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd_b), fx.make_view(lds.b_l1.ptr, _rd_b)]
+        sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd_b), fx.make_view(lds.b_r1.ptr, _rd_b)]
 
         aT_g = dma.partition_S(bA_t)
         aB_g = dma.partition_S(bA_b)
-        bL_g = dma.partition_S(bB_l)
-        bR_g = dma.partition_S(bB_r)
+        bL_g = dma_b.partition_S(bB_l)
+        bR_g = dma_b.partition_S(bB_r)
         aT_s = [dma.partition_D(sA_t_wr[0]), dma.partition_D(sA_t_wr[1])]
         aB_s = [dma.partition_D(sA_b_wr[0]), dma.partition_D(sA_b_wr[1])]
-        bL_s = [dma.partition_D(sB_l_wr[0]), dma.partition_D(sB_l_wr[1])]
-        bR_s = [dma.partition_D(sB_r_wr[0]), dma.partition_D(sB_r_wr[1])]
+        bL_s = [dma_b.partition_D(sB_l_wr[0]), dma_b.partition_D(sB_l_wr[1])]
+        bR_s = [dma_b.partition_D(sB_r_wr[0]), dma_b.partition_D(sB_r_wr[1])]
 
         # ---- LDS -> reg（对标 gemm_v9：A 走 B-operand，B 走 A-operand；均 padding rd）----
         # 每个 slice 只有一份寄存器 fragment（无寄存器双缓冲），双缓冲仅在 LDS 层（buf0/buf1）。
@@ -298,12 +343,21 @@ def compile_gemm_fp8(
         frag_C_bl.fill(0)
         frag_C_br.fill(0)
         rocdl.sched_barrier(0)
+        acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
 
         # ---- 主循环（对标 gemm_v9：单份 fragment，一次迭代吃 2 个 k-tile = 8 个 region）----
         # 每个 region：1 个象限 fx.gemm(C=B*A) + 下一 operand 的 s2r + 再下一块的 g2s，
         # 用 s2r_src0_*/s2r_src1_* 在 LDS buf0/buf1 之间 ping-pong；每个 slice 顺序与 gemm_v9 一致。
         # k-tile 内 4 个象限的顺序固定为：tl(A_t·B_l) -> bl(A_b·B_l) -> tr(A_t·B_r) -> br(A_b·B_r)。
-        for kidx in range_constexpr(0, num_tiles - 2, 2):
+        # 运行时循环（range + init/yield 累加器透传），不做常量展开。
+        
+        for kidx, states in range(0, num_tiles - 2, 2, init=acc_init):
+        # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
+
+            frag_C_tl.store(states[0])
+            frag_C_tr.store(states[1])
+            frag_C_bl.store(states[2])
+            frag_C_br.store(states[3])
             kiter = fx.Int32(kidx)
 
             # ---- k-tile = buf0：4 象限 ----
@@ -364,6 +418,12 @@ def compile_gemm_fp8(
             hot_loop_scheduler_mainloop(7, 4, 8)
             rocdl.sched_barrier(0)
 
+            results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+        frag_C_tl.store(results[0])
+        frag_C_tr.store(results[1])
+        frag_C_bl.store(results[2])
+        frag_C_br.store(results[3])
+
         # ---- epilogue：最后 2 个 k-tile（buf0 / buf1），无 g2s，只做 s2r + gemm ----
         # buf0 的 4 象限
         waitvmcnt_barrier(20)
@@ -390,47 +450,124 @@ def compile_gemm_fp8(
         hot_loop_scheduler_mainloop(3, 0, 8)
         rocdl.sched_barrier(0)
 
-        # buf1 的 4 象限（无更多 s2r，直接算完）
-        waitvmcnt_barrier(4)
-        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
-        fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
-        hot_loop_scheduler_mainloop(4, 0, 8)
-        rocdl.sched_barrier(0)
+        # ---- store_quadrant 定义提前（放到 buf1 尾部之前），供 store 与最后的 MFMA 交织 ----
+        if const_expr(permlane_epilogue):
+            # permlane：相邻两个 16x16 tile 经 permlane16_swap 重排后，每 lane 一次写 8 个连续 bf16
+            # （128-bit 合并写）。fp8 op1=B 走 fragment_A 槽 => C 的 wave 朝向相对 bf16 转置，
+            # 故 wave_m/wave_n 相对 bf16 permlane 互换（wave_m=wave_id//2, wave_n=wave_id%2）。
+            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            lane_id = tid % 64
+            wave_id = tid // 64
+            wave_m = wave_id // 2
+            wave_n = wave_id % 2
+            lane_group = lane_id // 16
+            fragment_mode_0_repeat = TILE_N // 64
+            fragment_mode_1_repeat = TILE_M // 64
 
-        waitvmcnt_barrier(0)
-        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-        fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-        hot_loop_scheduler_mainloop(5, 0, 8)
-        rocdl.sched_barrier(0)
+            def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
+                for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        swap0 = rocdl.permlane16_swap(pair_type, arith._to_raw(d0_a), arith._to_raw(d0_b), False, False)
+                        swap1 = rocdl.permlane16_swap(pair_type, arith._to_raw(d1_a), arith._to_raw(d1_b), False, False)
+                        packed = Vec.from_elements(
+                            [
+                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
+                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
+                            ],
+                            fx.Int32,
+                        )
+                        row = bid_x * TILE_M + quadrant_m * (TILE_M // 2) + row_repeat * 32 + wave_m * 16 + lane_id % 16
+                        col = (
+                            bid_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 32
+                            + lane_group % 2 * 32
+                            + wave_n * 16
+                            + lane_group // 2 * 8
+                        )
+                        byte_offset = (row * N + col) * 2
+                        fx.buffer_ops.buffer_store(packed, c_store_rsrc, byte_offset, offset_is_bytes=True)
+        else:
+            # 注意：fp8 op1=B 走 make_fragment_A 槽，C 的 wave 朝向相对 bf16 转置，
+            # 故 c_tv 的两个 wave 维 stride 需交换为 (512, 16)。
+            store_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            c_layout_w = fx.make_tiled_copy(
+                store_atom_bf16,
+                fx.make_layout(((16, 4, 2, 2), 4), ((1, 128, 512, 16), 32)),
+                fx.make_tile(32, 32),
+            )
+            store_thr = c_layout_w.get_slice(tid)
 
-        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-        hot_loop_scheduler_mainloop(6, 0, 0)
-        rocdl.sched_barrier(0)
-        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
-        hot_loop_scheduler_mainloop(7, 0, 0)
-        rocdl.sched_barrier(0)
+            def store_quadrant(c_frag, bC, quadrant_m=0, quadrant_n=0):
+                c_sel = fx.select(c_frag, [0, 2, 1])
+                c_bf16 = fx.make_fragment_like(c_sel, dtype=fx.BFloat16)
+                c_bf16.store(c_sel.load().to(fx.BFloat16))
+                fx.copy(store_atom_bf16, store_thr.retile(c_bf16), store_thr.partition_D(bC))
 
-        # ---- store: f32 -> bf16（暂不与 gemm 交织）----
-        # 注意：fp8 op1=B 走 make_fragment_A 槽，C 的 wave 朝向相对 bf16 转置，
-        # 故 c_tv 的两个 wave 维 stride 需交换为 (512, 16)。
-        store_atom_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
-        c_layout_w = fx.make_tiled_copy(
-            store_atom_bf16,
-            fx.make_layout(((16, 4, 2, 2), 4), ((1, 128, 512, 16), 32)),
-            fx.make_tile(32, 32),
-        )
-        store_thr = c_layout_w.get_slice(tid)
+        # buf1 的 4 象限。store_overlap 时把每象限的 store 与后一象限的 MFMA 交织，
+        # 用 MFMA 计算掩盖 buffer_store 的写延迟（对标 bf16 v9 scheduler_store_overlap）；
+        # 否则先算完 4 象限，再统一 store（不交织，用于对照）。
+        if const_expr(store_overlap):
+            waitvmcnt_barrier(4)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+            hot_loop_scheduler_mainloop(4, 0, 8)
+            rocdl.sched_barrier(0)
 
-        def store_quadrant(c_frag, bC):
-            c_sel = fx.select(c_frag, [0, 2, 1])
-            c_bf16 = fx.make_fragment_like(c_sel, dtype=fx.BFloat16)
-            c_bf16.store(c_sel.load().to(fx.BFloat16))
-            fx.copy(store_atom_bf16, store_thr.retile(c_bf16), store_thr.partition_D(bC))
+            waitvmcnt_barrier(0)
+            # bl 的 MFMA 与 tl 的 store 互相掩盖
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+            fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
+            store_quadrant(frag_C_tl, bC_tl, 0, 0)
+            scheduler_store_overlap(5)
+            rocdl.sched_barrier(0)
 
-        store_quadrant(frag_C_tl, bC_tl)
-        store_quadrant(frag_C_tr, bC_tr)
-        store_quadrant(frag_C_bl, bC_bl)
-        store_quadrant(frag_C_br, bC_br)
+            # tr 的 MFMA 掩盖 bl 的 store
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+            store_quadrant(frag_C_bl, bC_bl, 1, 0)
+            scheduler_store_overlap(6)
+            rocdl.sched_barrier(0)
+
+            # br 的 MFMA 掩盖 tr 的 store
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+            store_quadrant(frag_C_tr, bC_tr, 0, 1)
+            scheduler_store_overlap(7)
+            rocdl.sched_barrier(0)
+
+            # 最后 br 单独 store
+            store_quadrant(frag_C_br, bC_br, 1, 1)
+        else:
+            waitvmcnt_barrier(4)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
+            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+            hot_loop_scheduler_mainloop(4, 0, 8)
+            rocdl.sched_barrier(0)
+
+            waitvmcnt_barrier(0)
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
+            fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
+            hot_loop_scheduler_mainloop(5, 0, 8)
+            rocdl.sched_barrier(0)
+
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
+            hot_loop_scheduler_mainloop(6, 0, 0)
+            rocdl.sched_barrier(0)
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+            hot_loop_scheduler_mainloop(7, 0, 0)
+            rocdl.sched_barrier(0)
+
+            store_quadrant(frag_C_tl, bC_tl, 0, 0)
+            store_quadrant(frag_C_tr, bC_tr, 0, 1)
+            store_quadrant(frag_C_bl, bC_bl, 1, 0)
+            store_quadrant(frag_C_br, bC_br, 1, 1)
 
     @flyc.jit
     def launch_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
@@ -456,13 +593,32 @@ M = int(os.environ.get("GEMM_M", 4096))
 N = int(os.environ.get("GEMM_N", 4096))
 K = int(os.environ.get("GEMM_K", 4096))
 
+# preshuffle B：host 端把 B 预 shuffle 成 MFMA 友好布局；kernel 内 B 无需 swizzle/padding。
+# fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
+PRESHUFFLE_B = _env_flag("PRESHUFFLE_B")
+# permlane 存储：相邻 16x16 tile 经 permlane16_swap 合并成 128-bit 连续写（对标 bf16 v9）。
+PERMLANE_EPILOGUE = _env_flag("PERMLANE", "1")
+# store 与最后的 MFMA 交织（用 MFMA 掩盖 buffer_store 写延迟）。默认关，STORE_OVERLAP=1 开启。
+STORE_OVERLAP = _env_flag("STORE_OVERLAP")
+if PRESHUFFLE_B:
+    import sys as _sys, os.path as _osp
+    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
+    if _flydsl_root not in _sys.path:
+        _sys.path.insert(0, _flydsl_root)
+    from tests.utils import shuffle_weight
+
+
+def _shuffle_b(b):
+    return shuffle_weight(b, layout=(16, 64)) if PRESHUFFLE_B else b
+
 
 def _make_problem():
     a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
     b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
     ref = a.float() @ b.float().t()
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
-    args = (a.view(torch.int8).view(-1), b.view(torch.int8).view(-1), out.view(-1), M, torch.cuda.current_stream())
+    weight = _shuffle_b(b)  # preshuffle 时喂 shuffle 后的 B；ref 仍用原始 b
+    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1), M, torch.cuda.current_stream())
     return out, ref, args
 
 
@@ -472,7 +628,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     out, ref, args = _make_problem()
-    launcher = compile_gemm_fp8(TILE_M, TILE_N, TILE_K, N, K, lds_swizzle=_env_flag("SWIZZLE"))
+    launcher = compile_gemm_fp8(TILE_M, TILE_N, TILE_K, N, K, lds_swizzle=_env_flag("SWIZZLE"), preshuffle_b=PRESHUFFLE_B, permlane_epilogue=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     kernel(*args)
     torch.cuda.synchronize()
@@ -491,7 +647,7 @@ if __name__ == "__main__":
     data_clones = 32
     run_count = 50
     As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
-    Bs = [torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
+    Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
     stream = torch.cuda.current_stream()
     arg_sets = [
