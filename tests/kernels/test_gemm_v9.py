@@ -34,51 +34,54 @@ def anchor_frag(frag):
         has_side_effects=True,
     )
 
-def hot_loop_scheduler_mainloop(group_id):
+def hot_loop_scheduler(group_id, vmem_cnt, lds_cnt, mfma_cnt):
+    mfma_prolog = 4
+    assert (vmem_cnt*4 + lds_cnt + mfma_prolog) <= mfma_cnt
 
-    for _ in range_constexpr(4):
+    mfma_epilog = mfma_cnt - mfma_prolog - vmem_cnt*4 - lds_cnt
+    #每一条MFMA指令单独schedule, 避免多个一组组内会打乱顺序。
+    for _ in range_constexpr(mfma_prolog):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    for _ in range_constexpr(8):
+    for _ in range_constexpr(lds_cnt):
         rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    for _ in range_constexpr(4):
+    for _ in range_constexpr(vmem_cnt):
         rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    # 以 2 条 MFMA 为一组调度：同一 accumulator 的 k0/k1（真依赖链）落在同一组内
-    # 背靠背发射 -> 命中 GFXIPARCH-1380 suppression；组间穿插 ds_read / vmem 掩盖延迟。
-    # for _ in range_constexpr(8):
-    #     rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    for _ in range_constexpr(4):
+    for _ in range_constexpr(mfma_epilog):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-
-
-def scheduler_epilog(group_id):
-    
-    for _ in range_constexpr(12):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    for _ in range_constexpr(8):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
-    for _ in range_constexpr(12):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-
 
 # VMEM_WRITE / VALU 掩码（flydsl 未导出 vmem_wr 常量，直接用 bit 值）。
 _MASK_VALU = 0x002
 _MASK_VMEM_WR = 0x040
 
 
-def scheduler_store_overlap(group_id):
-    # MFMA 领先：每发 4 条 MFMA，穿插 store 的 VALU(cvt/permlane) 与 buffer_store(vmem_wr)，
-    # 用 MFMA 计算掩盖 store 的写延迟（MFMA 必须领先，否则 store 会挡住计算流水）。
-    for _ in range_constexpr(8):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
-        rocdl.sched_group_barrier(_MASK_VALU, 6, group_id)
-        rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
+# def scheduler_store_overlap(group_id):
+#     # MFMA 领先：每发 4 条 MFMA，穿插 store 的 VALU(cvt/permlane) 与 buffer_store(vmem_wr)，
+#     # 用 MFMA 计算掩盖 store 的写延迟（MFMA 必须领先，否则 store 会挡住计算流水）。
+#     for _ in range_constexpr(8):
+#         rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
+#         rocdl.sched_group_barrier(_MASK_VALU, 6, group_id)
+#         rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
 
+def scheduler_store_overlap(group_id, store_cnt, lds_cnt, mfma_cnt):
+    assert store_cnt >= lds_cnt and mfma_cnt >= (lds_cnt + store_cnt)
+    for _ in range_constexpr(lds_cnt):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
+    for _ in range_constexpr(store_cnt - lds_cnt):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
+    for _ in range_constexpr(mfma_cnt - lds_cnt - store_cnt):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+
+
+    
 # every 8 contineous row pad 16 elements. (need 128/8-1) * 16 elements padding totally.
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
@@ -193,7 +196,6 @@ def compile_gemm(
     N,
     K,
     dtype="bf16",
-    pin_bf16_agpr=True,
     lds_swizzle=False,
     pid_swizzle=False,
     permlane_epilogue=True,
@@ -510,8 +512,20 @@ def compile_gemm(
         rocdl.sched_barrier(0)
         fx.copy(async_copy_atom, ac_src_B_r[None, None, None, 1], ac_dest1_B_r)
         rocdl.sched_barrier(0)
-        
-        waitvmcnt_barrier(24)
+
+        nrM = BLOCK_M // (16*2)
+        nrN = BLOCK_N // (16*2)
+        nrK = BLOCK_K // 32
+        mfma_cnt = nrM * nrN * nrK
+        assert nrM == nrN
+        elems_per_lane = 8 if dtype == "bf16" else 16
+        vm_load_cnt = (BLOCK_M*BLOCK_K) // 256 // elems_per_lane
+        ds_rd_cnt = vm_load_cnt * 2
+        vm_store_cnt = (BLOCK_M*BLOCK_N) // 256 // elems_per_lane
+        if not permlane_epilogue:
+            vm_store_cnt *= 2
+
+        waitvmcnt_barrier(6*vm_load_cnt)
         gpu.barrier()
         fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
@@ -532,67 +546,67 @@ def compile_gemm(
             kiter = fx.Int32(kidx)
             mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, mode=mfma_mode)
 
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+2], ac_dest0_B_l)
-            hot_loop_scheduler_mainloop(0)
+            hot_loop_scheduler(0, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
 
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+2], ac_dest0_A_t)
-            hot_loop_scheduler_mainloop(1)
+            hot_loop_scheduler(1, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+2], ac_dest0_A_b)
-            hot_loop_scheduler_mainloop(2)
+            hot_loop_scheduler(2, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
         
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+2], ac_dest0_B_r)
-            hot_loop_scheduler_mainloop(3)
+            hot_loop_scheduler(3, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
 
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, ac_src_B_l[None, None, None, kiter+3], ac_dest1_B_l)
-            hot_loop_scheduler_mainloop(4)
+            hot_loop_scheduler(4, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, ac_src_A_t[None, None, None, kiter+3], ac_dest1_A_t)
-            hot_loop_scheduler_mainloop(5)
+            hot_loop_scheduler(5, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_l)
             rocdl.sched_barrier(0)
             
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, ac_src_A_b[None, None, None, kiter+3], ac_dest1_A_b)
-            hot_loop_scheduler_mainloop(6)
+            hot_loop_scheduler(6, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
             
+            waitvmcnt_barrier(5*vm_load_cnt)
             mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
-            waitvmcnt_barrier(20)
             fx.copy(lsd_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, ac_src_B_r[None, None, None, kiter+3], ac_dest1_B_r)
-            hot_loop_scheduler_mainloop(7)
+            hot_loop_scheduler(7, vm_load_cnt, ds_rd_cnt, mfma_cnt)
             anchor_frag(frag_B_r)
             rocdl.sched_barrier(0)
 
@@ -606,28 +620,28 @@ def compile_gemm(
             
         mfma_16x16x64 = Mfma16x16x64(4, 4, mma_atom, mode=mfma_mode)
 
-        waitvmcnt_barrier(20)
+        waitvmcnt_barrier(5*vm_load_cnt)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
-        scheduler_epilog(0)
+        hot_loop_scheduler(0, 0, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(16)
+        waitvmcnt_barrier(4*vm_load_cnt)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-        scheduler_epilog(1)
+        hot_loop_scheduler(1, 0, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(12)
+        waitvmcnt_barrier(3*vm_load_cnt)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         fx.copy(lsd_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-        scheduler_epilog(2)
+        hot_loop_scheduler(2, 0, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(8)
+        waitvmcnt_barrier(2*vm_load_cnt)
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         fx.copy(lsd_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-        scheduler_epilog(3)
+        hot_loop_scheduler(3, 0, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
         # epilogue store：提前建立 store 辅助，使其能与最后的 MFMA 交织，互相掩盖延迟。
@@ -714,10 +728,10 @@ def compile_gemm(
                 c_bf16.store(c_sel.load().to(fx.BFloat16))
                 fx.copy(store_atom_bf16, thr_copy_C_bf16.retile(c_bf16), thr_copy_C_bf16.partition_D(bC))
 
-        waitvmcnt_barrier(4)
+        waitvmcnt_barrier(vm_load_cnt)
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_l, frag_C_tl)
         fx.copy(lsd_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
-        scheduler_epilog(4)
+        hot_loop_scheduler(4, 0, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(0)
@@ -725,19 +739,19 @@ def compile_gemm(
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_l, frag_C_bl)
         fx.copy(lsd_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
         store_quadrant(frag_C_tl, bC_tl, 0, 0)
-        scheduler_store_overlap(5)
+        scheduler_store_overlap(5, vm_store_cnt, ds_rd_cnt, mfma_cnt)
         rocdl.sched_barrier(0)
 
         # tr 的 FMA 掩盖 bl 的存储
         mfma_16x16x64.call_BxA(frag_A_t, frag_B_r, frag_C_tr)
         store_quadrant(frag_C_bl, bC_bl, 1, 0)
-        scheduler_store_overlap(6)
+        scheduler_store_overlap(6, vm_store_cnt, 0, mfma_cnt)
         rocdl.sched_barrier(0)
 
         # br 的 FMA 掩盖 tr 的存储
         mfma_16x16x64.call_BxA(frag_A_b, frag_B_r, frag_C_br)
         store_quadrant(frag_C_tr, bC_tr, 0, 1)
-        scheduler_store_overlap(7)
+        scheduler_store_overlap(7, vm_store_cnt, 0, mfma_cnt)
         rocdl.sched_barrier(0)
 
         # 最后 br 单独存储
@@ -763,95 +777,69 @@ def compile_gemm(
     return launch_gemm
 
 
-TILE_M = 256
-TILE_N = 256
-TILE_K = 64
-M = TILE_M *32
-N = TILE_N*32
-K = TILE_K*128
-USE_SWIZZLE=_env_flag("SWIZZLE", "0")
-# True: permlane 方式（一次 store 8 个 bf16）；False: 简单 bf16 tiled-copy 存储。两者都输出 bf16。
-PERMLANE_EPILOGUE = True
-# MFMA 发射方式: ROCDL(调度器自由重排,k外提) / INLINE_ASM_K2(k0k1背靠背) / FX_GEMM
-MFMA_MODE = MfmaMode[os.environ.get("MFMA_MODE", "ROCDL")]
-# preshuffle B: host 端把 B 预 shuffle 成 MFMA 友好布局；kernel 内 B 无需 swizzle/padding。
-PRESHUFFLE_B = _env_flag("PRESHUFFLE_B", "0")
-if PRESHUFFLE_B:
+import pyhip
+
+
+
+def _load_shuffle_weight():
+    # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
     import sys as _sys, os.path as _osp
     _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
     if _flydsl_root not in _sys.path:
         _sys.path.insert(0, _flydsl_root)
     from tests.utils import shuffle_weight
-OUT_DTYPE = torch.bfloat16
-OUT_ATOL = 0.03
-OUT_RTOL = 0.01
-OUT_BYTES = 2
-enable_dump_ir(True)
-# assert BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "BLOCK_M, BLOCK_N, BLOCK_K must be 128, 128, 64"
-A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
-expected = A.to(torch.float32) @ B.to(torch.float32).T
-# preshuffle 时喂给 kernel 的是 shuffle 后的 B；expected 仍用原始 B。
-weight = shuffle_weight(B, layout=(16, 16)) if PRESHUFFLE_B else B
+    return shuffle_weight
 
-hints = {
-    "opt_level" : 2,
-    "llvm_options": {"amdgpu-mfma-vgpr-form": False},
-}
-stream=torch.cuda.Stream()
-launcher_gemm = compile_gemm(TILE_M = 256,
-    TILE_N = 256,
-    TILE_K = 64,
-    N = N,
-    K = K,
-    dtype="bf16",
-    pin_bf16_agpr=True,
-    lds_swizzle=USE_SWIZZLE,
-    pid_swizzle=True,
-    permlane_epilogue=PERMLANE_EPILOGUE,
-    mfma_mode=MFMA_MODE,
-    preshuffle_b=PRESHUFFLE_B)
 
-compiled_gemm = flyc.compile[hints](launcher_gemm, A, weight, C, M, stream)
-compiled_gemm(A, weight, C, M, stream)
-torch.cuda.synchronize()
+def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
+             TILEM=256, TILEN=256, TILEK=64, run_count=16, data_clones=32):
+    shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
+    enable_dump_ir(False)
 
-torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-is_correct = torch.allclose(expected, C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL)
+    OUT_DTYPE = torch.bfloat16
+    OUT_ATOL = 0.03
+    OUT_RTOL = 0.01
+    OUT_BYTES = 2
+    # MFMA 发射方式: ROCDL(调度器自由重排,k外提) / INLINE_ASM_K2(k0k1背靠背) / FX_GEMM
+    # MFMA_MODE = MfmaMode[os.environ.get("MFMA_MODE", "ROCDL")]
+    MFMA_MODE = MfmaMode["ROCDL"]
+    # True: permlane 方式（一次 store 8 个 bf16）；False: 简单 bf16 tiled-copy 存储。两者都输出 bf16。
+    PERMLANE_EPILOGUE = True
 
-print(f'{PRESHUFFLE_B=} {USE_SWIZZLE=} {is_correct=}')
+    A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
+    B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
+    C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
+    expected = A.to(torch.float32) @ B.to(torch.float32).T
+    # preshuffle 时喂给 kernel 的是 shuffle 后的 B；expected 仍用原始 B。
+    weight = shuffle_weight(B, layout=(16, 16)) if PRESHUFFLE_B else B
 
-import pyhip
-
-def compare_perf(run_count=16, data_clones=32):
-    _A = torch.randn(M, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-    _B = torch.randn(N, K, dtype=torch.bfloat16).cuda() / math.sqrt(K)
-    _C = torch.zeros(M, N, dtype=OUT_DTYPE).cuda()
-
-    _hints = {"opt_level": 2, "llvm_options": {"amdgpu-mfma-vgpr-form": False}}
-    _stream = torch.cuda.current_stream()
-    launcher_gemm = compile_gemm(TILE_M = 256,
-        TILE_N = 256,
-        TILE_K = 64,
-        N = N,
-        K = K,
+    hints = {"opt_level": 2, "llvm_options": {"amdgpu-mfma-vgpr-form": False}}
+    stream = torch.cuda.current_stream()
+    launcher_gemm = compile_gemm(
+        TILE_M=TILEM,
+        TILE_N=TILEN,
+        TILE_K=TILEK,
+        N=N,
+        K=K,
         dtype="bf16",
-        pin_bf16_agpr=True,
         lds_swizzle=USE_SWIZZLE,
         pid_swizzle=True,
         permlane_epilogue=PERMLANE_EPILOGUE,
         mfma_mode=MFMA_MODE,
         preshuffle_b=PRESHUFFLE_B)
-    _weight = shuffle_weight(_B, layout=(16, 16)) if PRESHUFFLE_B else _B
-    _compiled = flyc.compile[_hints](launcher_gemm, _A, _weight, _C, M, _stream)
 
-    # accuracy
-    _expected = _A.to(torch.float32) @ _B.to(torch.float32).T
-    _compiled(_A, _weight, _C, M, _stream)
+    compiled_gemm = flyc.compile[hints](launcher_gemm, A, weight, C, M, stream)
+    compiled_gemm(A, weight, C, M, stream)
     torch.cuda.synchronize()
-    acc = "pass" if torch.allclose(_expected, _C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL) else "failed"
 
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8)
+    is_correct = torch.allclose(expected, C.to(torch.float32), atol=OUT_ATOL, rtol=OUT_RTOL)
+    print(f'####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {is_correct=}')
+
+    if not perf:
+        return is_correct
+
+    # ---- perf（多份数据轮转，排除 L2 cache 影响）----
     As = [torch.randn(M, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
     Bs = [torch.randn(N, K, dtype=torch.bfloat16).cuda() for _ in range(data_clones)]
     if PRESHUFFLE_B:
@@ -864,31 +852,31 @@ def compare_perf(run_count=16, data_clones=32):
     di = 0
     latencies = []
     torch_latencies = []
-
     for _ in range(run_count):
         di = (di + 1) % data_clones
         with pyhip.cudaPerf(flops, mem_bytes, name=f"gemm_{di}") as p:
-            _compiled(As[di], Bs[di], Cs[di], M, _stream)
+            compiled_gemm(As[di], Bs[di], Cs[di], M, stream)
         latencies.append(p.dt_ms)
-
     for _ in range(run_count):
         di = (di + 1) % data_clones
         with pyhip.cudaPerf(flops, mem_bytes, name=f"torch_{di}") as p:
-            _ = torch.nn.functional.linear(As[di], Bs[di]) 
+            _ = torch.nn.functional.linear(As[di], Bs[di])
         torch_latencies.append(p.dt_ms)
 
     latencies.sort()
     torch_latencies.sort()
-
     best_ms = latencies[0]
     tflops = flops / (best_ms * 1e-3) / 1e12
     bw_gbs = mem_bytes / (best_ms * 1e-3) / 1e9
 
-    print(f"\n=== compare_perf  M={M} N={N} K={K} ===")
-    print(f"acc:   {acc}")
+    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} ===")
     print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
     print(f"torch: {torch_latencies[0]*1e3:.1f} us")
     print(f"ratio: {torch_latencies[0]/best_ms:.2f}x")
+    return is_correct
 
 
-compare_perf()
+run_test(M=256 * 32,N=256 * 32,K=64 * 128,USE_SWIZZLE=0,PRESHUFFLE_B=0,perf=1,)
+run_test(M=256 * 32,N=256 * 32,K=64 * 128,USE_SWIZZLE=1,PRESHUFFLE_B=0,perf=1,)
+run_test(M=256 * 32,N=256 * 32,K=64 * 128,USE_SWIZZLE=0,PRESHUFFLE_B=1,perf=1,)
+run_test(M=256 * 32,N=256 * 32,K=64 * 128,USE_SWIZZLE=1,PRESHUFFLE_B=1,perf=1,)

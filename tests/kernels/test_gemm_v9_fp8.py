@@ -589,67 +589,69 @@ def compile_gemm_fp8(
 TILE_M = 256
 TILE_N = 256
 TILE_K = 128
-M = int(os.environ.get("GEMM_M", 4096))
-N = int(os.environ.get("GEMM_N", 4096))
-K = int(os.environ.get("GEMM_K", 4096))
+M = int(os.environ.get("GEMM_M", 8192))
+N = int(os.environ.get("GEMM_N", 8192))
+K = int(os.environ.get("GEMM_K", 8192))
 
-# preshuffle B：host 端把 B 预 shuffle 成 MFMA 友好布局；kernel 内 B 无需 swizzle/padding。
-# fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
-PRESHUFFLE_B = _env_flag("PRESHUFFLE_B")
-# permlane 存储：相邻 16x16 tile 经 permlane16_swap 合并成 128-bit 连续写（对标 bf16 v9）。
+# permlane 存储 / store 与 MFMA 交织：可用环境变量覆盖默认值（对标 bf16 v9 run_test 结构）。
 PERMLANE_EPILOGUE = _env_flag("PERMLANE", "1")
-# store 与最后的 MFMA 交织（用 MFMA 掩盖 buffer_store 写延迟）。默认关，STORE_OVERLAP=1 开启。
 STORE_OVERLAP = _env_flag("STORE_OVERLAP")
-if PRESHUFFLE_B:
+
+import pyhip
+
+
+def _load_shuffle_weight():
+    # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
+    # fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
     import sys as _sys, os.path as _osp
     _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
     if _flydsl_root not in _sys.path:
         _sys.path.insert(0, _flydsl_root)
     from tests.utils import shuffle_weight
+    return shuffle_weight
 
 
-def _shuffle_b(b):
-    return shuffle_weight(b, layout=(16, 64)) if PRESHUFFLE_B else b
+def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
+             TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
+             run_count=50, data_clones=32):
+    shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
 
+    def _shuffle_b(x):
+        return shuffle_weight(x, layout=(16, 64)) if PRESHUFFLE_B else x
 
-def _make_problem():
     a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
     b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
     ref = a.float() @ b.float().t()
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     weight = _shuffle_b(b)  # preshuffle 时喂 shuffle 后的 B；ref 仍用原始 b
-    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1), M, torch.cuda.current_stream())
-    return out, ref, args
+    stream = torch.cuda.current_stream()
+    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1), M, stream)
 
-
-if __name__ == "__main__":
-    props = torch.cuda.get_device_properties()
-    assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
-    torch.manual_seed(0)
-
-    out, ref, args = _make_problem()
-    launcher = compile_gemm_fp8(TILE_M, TILE_N, TILE_K, N, K, lds_swizzle=_env_flag("SWIZZLE"), preshuffle_b=PRESHUFFLE_B, permlane_epilogue=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
+    launcher = compile_gemm_fp8(
+        TILEM, TILEN, TILEK, N, K,
+        lds_swizzle=USE_SWIZZLE,
+        preshuffle_b=PRESHUFFLE_B,
+        permlane_epilogue=permlane_output,
+        store_overlap=store_overlap,
+    )
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     kernel(*args)
     torch.cuda.synchronize()
 
-    acc = torch.allclose(out.float(), ref, rtol=0.05, atol=0.5)
-    print(f"fp8 v9-style  M={M} N={N} K={K}  BLOCK={TILE_M//2}x{TILE_N//2}x{TILE_K}  is_correct={acc}")
-    if not acc:
+    is_correct = torch.allclose(out.float(), ref, rtol=0.05, atol=0.5)
+    print(f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {is_correct=}")
+    if not is_correct:
         mism = (out.float() - ref).abs()
         print(f"  max_abs_err={mism.max().item():.3f}  mism_count={(mism>0.5).sum().item()}/{M*N}")
 
-    # ---- perf（对标 test_gemm_v9.py compare_perf：pyhip.cudaPerf + 多份数据轮转）----
-    # 多份数据轮转：A/B/C 各 data_clones 份，轮流喂入。单份 A+B 只有几十 MB，反复喂同一份
-    # 会常驻 L2 -> 高估 TFLOPS；轮转多份（远大于 L2）确保每次都是 cold data，排除 cache 影响。
-    import pyhip
+    if not perf:
+        return is_correct
 
-    data_clones = 32
-    run_count = 50
+    # ---- perf（多份数据轮转，排除 L2 cache 影响）----
+    # 单份 A+B 只有几十 MB，反复喂同一份会常驻 L2 -> 高估 TFLOPS；轮转多份（远大于 L2）确保 cold data。
     As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
     Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
-    stream = torch.cuda.current_stream()
     arg_sets = [
         (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), Cs[i].view(-1), M, stream)
         for i in range(data_clones)
@@ -663,7 +665,6 @@ if __name__ == "__main__":
         kernel(*arg_sets[i])
     torch.cuda.synchronize()
 
-    # 每次测一个 kernel launch，轮转 clone，取最优（best）延迟
     di = 0
     latencies = []
     for _ in range(run_count):
@@ -675,4 +676,16 @@ if __name__ == "__main__":
     best_ms = latencies[0]
     tflops = flops / (best_ms * 1e-3) / 1e12
     bw_gbs = mem_bytes / (best_ms * 1e-3) / 1e9
-    print(f"  perf(best, {data_clones} clones): {best_ms*1e3:8.1f} us   {tflops:8.1f} TFLOPS   {bw_gbs:8.1f} GB/s")
+    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} ===")
+    print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
+    return is_correct
+
+
+if __name__ == "__main__":
+    props = torch.cuda.get_device_properties()
+    assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
+    torch.manual_seed(0)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
