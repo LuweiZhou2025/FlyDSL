@@ -248,10 +248,7 @@ def compile_gemm_fp8_8wave(
         frag_C_tr = thr_mma.make_fragment_C(bC_tr)
         frag_C_bl = thr_mma.make_fragment_C(bC_bl)
         frag_C_br = thr_mma.make_fragment_C(bC_br)
-        frag_C_tl.fill(0)
-        frag_C_tr.fill(0)
-        frag_C_bl.fill(0)
-        frag_C_br.fill(0)
+
 
         # ==== block-scale (a8w8) 设置：A per-token group-128，B block-wise 128x128 ====
         # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * (fp8 partial over k-block kb)。
@@ -323,13 +320,16 @@ def compile_gemm_fp8_8wave(
 
         def begin_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
             rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            rocdl.s_setprio(1)
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
             rocdl.sched_barrier(0)
             rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
@@ -342,9 +342,15 @@ def compile_gemm_fp8_8wave(
         def do_g2s(kk, buf):
             ki = fx.Int32(kk)
             fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
+            rocdl.sched_barrier(0)
             fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
+            rocdl.sched_barrier(0)
             fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
+            rocdl.sched_barrier(0)
+
             fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
+            rocdl.sched_barrier(0)
+
 
         # ---- 非 scale 版：对标 pyhip gemm_8wave 的 4-phase 精确流水 ----
         # 每 tile 分 4 个 compute-phase（TL/TR/BL/BR，各一条 MFMA），phase 间穿插一次
@@ -381,60 +387,45 @@ def compile_gemm_fp8_8wave(
         def _ld_Br(b, ki):
             fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[b])
 
-        def _ns_cphase(fc, fb):
-            rocdl.s_waitcnt(_lgkm0)
-            rocdl.s_setprio(1)
-            do_gemm(fc, fb, frag_A_t, None, None)
-            rocdl.s_setprio(0)
+  
+        rocdl.sched_barrier(0)
+        _ld_Bl(0, 0)
+        rocdl.sched_barrier(0)
+        _ld_At(0, 0)
+        rocdl.sched_barrier(0)
+        _ld_Br(0, 0)
+        rocdl.sched_barrier(0)
+        _ld_Ab(0, 0)
+        rocdl.sched_barrier(0)
+        if wave_id >= 4:
             rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-
-        def _ns_membar(vmcnt=None):
-            if const_expr(vmcnt is not None):
-                rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt, lgkmcnt=0))
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-
-        def ns_tile(b, kpf):
-            # 消费 buf b（当前 tile 已在 LDS），并把 tile kpf 预取回 buf b（读后即刷）。
-            _rd_Bl(b)
-            _rd_At(b)
-            _ns_membar()
-            _ns_cphase(frag_C_tl, frag_B_l)          # P0 TL
-            _rd_Br(b)
-            _ld_At(b, kpf)
-            _ns_membar()
-            _ns_cphase(frag_C_tr, frag_B_r)          # P1 TR
-            _rd_Ab(b)
-            _ld_Bl(b, kpf)
-            _ns_membar()
-            _ns_cphase(frag_C_bl, frag_B_l)          # P2 BL
-            _ld_Br(b, kpf)
-            _ld_Ab(b, kpf)
-            _ns_membar(vmcnt=NS_VMCNT)
-            _ns_cphase(frag_C_br, frag_B_r)          # P3 BR
+        frag_C_tl.fill(0)
+        frag_C_tr.fill(0)
+        frag_C_bl.fill(0)
+        frag_C_br.fill(0)
+    
+        vm_load_cnt_a = 2
+        vm_load_cnt_b = 2
+    
+        rocdl.sched_barrier(0)
+        vmcnt = vm_load_cnt_a + vm_load_cnt_b
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
+        rocdl.s_barrier()
+        rocdl.sched_barrier(0)
 
         rocdl.sched_barrier(0)
-        do_g2s(0, 0)
-        do_g2s(1, 1)
-        if const_expr(with_scale):
-            wait_vmem_barrier(prologue_vmcnt)
-            fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
-            fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
-            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            if wave_id >= 4:
-                rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-        else:
-            # 非 scale：tile0/tile1 完整落 LDS（ns_tile 内部自读），再做 ping-pong 偏移 barrier
-            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            rocdl.s_barrier()
-            if wave_id >= 4:
-                rocdl.s_barrier()
-            rocdl.sched_barrier(0)
+        _ld_At(1, 1)
+        rocdl.sched_barrier(0)
+        _ld_Bl(1, 1)
+        rocdl.sched_barrier(0)
+        _ld_Br(1, 1)
+        rocdl.sched_barrier(0)
+        
+        vmcnt = vm_load_cnt_a + vm_load_cnt_b*2
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
 
         acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
-        for kidx, states in range(0, num_tiles - 2, 2, init=acc_init):
+        for kidx, states in range(0, num_tiles, 2, init=acc_init):
             frag_C_tl.store(states[0])
             frag_C_tr.store(states[1])
             frag_C_bl.store(states[2])
@@ -442,144 +433,209 @@ def compile_gemm_fp8_8wave(
             kiter = fx.Int32(kidx)
 
             if const_expr(not with_scale):
-                # 非 scale：pyhip 式 4-phase 精确流水（buf0=tile kidx 预取 kidx+2；buf1=kidx+1 预取 kidx+3）
-                ns_tile(0, kiter + 2)
-                ns_tile(1, kiter + 3)
-                results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
-                continue
+                tick = 0
+                tock = 1
+                _rd_Bl(tick)
+                _rd_At(tick)
+                _ld_Ab(tock, kiter+1)
+                rocdl.sched_barrier(0)
+                rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+                rocdl.sched_barrier(0)
+        
+                begin_compute_phase()
+                do_gemm(frag_C_tl, frag_B_l, frag_A_t, None, None)
+                end_compute_phase()
+                
+                _rd_Br(tick)
+                _ld_At(tick, kiter+2)
 
-            # ===== 单缓冲 A + ping-pong B（象限序 TL,TR,BL,BR）；scale 按象限组 lazy 加载 =====
-            # 每组仅持 4(scaleA)+2(scaleB) 个 SSA，避免像预取 16 个那样长期占用寄存器。
-            # buf0 = tile kidx
-            if const_expr(with_scale):
-                sA_t0 = _load_sA(sA_top_baseM, kiter)
-                sB_l0 = _load_sB(nb_l, kiter)
-                sB_r0 = _load_sB(nb_r, kiter)
-            else:
-                sA_t0 = sB_l0 = sB_r0 = None
-            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            rocdl.s_barrier()
-            fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
-            fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
-            fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            begin_compute_phase()
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t0, sB_l0)
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t0, sB_r0)
-            end_compute_phase()
-            if const_expr(with_scale):
-                sA_b0 = _load_sA(sA_bot_baseM, kiter)
-            else:
-                sA_b0 = None
-            fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
-            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            begin_compute_phase()
-            do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b0, sB_l0)
-            do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b0, sB_r0)
-            end_compute_phase()
-            rocdl.s_barrier()
-            fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
+                begin_compute_phase()
+                do_gemm(frag_C_tr, frag_B_r, frag_A_t, None, None)
+                end_compute_phase()
 
-            # buf1 = tile kidx+1
-            if const_expr(with_scale):
-                sA_t1 = _load_sA(sA_top_baseM, kiter + 1)
-                sB_l1 = _load_sB(nb_l, kiter + 1)
-                sB_r1 = _load_sB(nb_r, kiter + 1)
-            else:
-                sA_t1 = sB_l1 = sB_r1 = None
-            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            rocdl.s_barrier()
-            fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-            fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-            fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            begin_compute_phase()
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t1, sB_l1)
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t1, sB_r1)
-            end_compute_phase()
-            if const_expr(with_scale):
-                sA_b1 = _load_sA(sA_bot_baseM, kiter + 1)
-            else:
-                sA_b1 = None
-            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
-            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            begin_compute_phase()
-            do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b1, sB_l1)
-            do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b1, sB_r1)
-            end_compute_phase()
-            rocdl.s_barrier()
-            fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
+                _rd_Ab(tick)
+                _ld_Bl(tick, kiter+2)
 
+                begin_compute_phase()
+                do_gemm(frag_C_bl, frag_B_l, frag_A_t, None, None)
+                end_compute_phase()
+
+                _ld_Br(tick, kiter+2)
+                rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b*2))
+                
+                begin_compute_phase()
+                do_gemm(frag_C_br, frag_B_r, frag_A_t, None, None)
+                end_compute_phase()
+                
+                
+                tick = 1
+                tock = 0
+                _rd_Bl(tick)
+                _rd_At(tick)
+                _ld_Ab(tock, kiter+2)
+                rocdl.sched_barrier(0)
+                rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+                rocdl.sched_barrier(0)
+        
+                begin_compute_phase()
+                do_gemm(frag_C_tl, frag_B_l, frag_A_t, None, None)
+                end_compute_phase()
+                
+                _rd_Br(tick)
+                _ld_At(tick, kiter+3)
+
+                begin_compute_phase()
+                do_gemm(frag_C_tr, frag_B_r, frag_A_t, None, None)
+                end_compute_phase()
+
+                _rd_Ab(tick)
+                _ld_Bl(tick, kiter+3)
+
+                begin_compute_phase()
+                do_gemm(frag_C_bl, frag_B_l, frag_A_t, None, None)
+                end_compute_phase()
+
+                _ld_Br(tick, kiter+3)
+                rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b*2))
+                
+                begin_compute_phase()
+                do_gemm(frag_C_br, frag_B_r, frag_A_t, None, None)
+                end_compute_phase()
             results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+                
+            # else:
+
+            #     # ===== 单缓冲 A + ping-pong B（象限序 TL,TR,BL,BR）；scale 按象限组 lazy 加载 =====
+            #     # 每组仅持 4(scaleA)+2(scaleB) 个 SSA，避免像预取 16 个那样长期占用寄存器。
+            #     # buf0 = tile kidx
+            #     if const_expr(with_scale):
+            #         sA_t0 = _load_sA(sA_top_baseM, kiter)
+            #         sB_l0 = _load_sB(nb_l, kiter)
+            #         sB_r0 = _load_sB(nb_r, kiter)
+            #     else:
+            #         sA_t0 = sB_l0 = sB_r0 = None
+            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+            #     rocdl.s_barrier()
+            #     fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+            #     fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
+            #     fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
+            #     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            #     begin_compute_phase()
+            #     do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t0, sB_l0)
+            #     do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t0, sB_r0)
+            #     end_compute_phase()
+            #     if const_expr(with_scale):
+            #         sA_b0 = _load_sA(sA_bot_baseM, kiter)
+            #     else:
+            #         sA_b0 = None
+            #     fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
+            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+            #     begin_compute_phase()
+            #     do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b0, sB_l0)
+            #     do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b0, sB_r0)
+            #     end_compute_phase()
+            #     rocdl.s_barrier()
+            #     fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
+            #     fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
+            #     fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
+            #     fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
+
+            #     # buf1 = tile kidx+1
+            #     if const_expr(with_scale):
+            #         sA_t1 = _load_sA(sA_top_baseM, kiter + 1)
+            #         sB_l1 = _load_sB(nb_l, kiter + 1)
+            #         sB_r1 = _load_sB(nb_r, kiter + 1)
+            #     else:
+            #         sA_t1 = sB_l1 = sB_r1 = None
+            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+            #     rocdl.s_barrier()
+            #     fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
+            #     fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
+            #     fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
+            #     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            #     begin_compute_phase()
+            #     do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t1, sB_l1)
+            #     do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t1, sB_r1)
+            #     end_compute_phase()
+            #     if const_expr(with_scale):
+            #         sA_b1 = _load_sA(sA_bot_baseM, kiter + 1)
+            #     else:
+            #         sA_b1 = None
+            #     fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
+            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+            #     begin_compute_phase()
+            #     do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b1, sB_l1)
+            #     do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b1, sB_r1)
+            #     end_compute_phase()
+            #     rocdl.s_barrier()
+            #     fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
+            #     fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
+            #     fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
+            #     fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
+            #     results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
 
         frag_C_tl.store(results[0])
         frag_C_tr.store(results[1])
         frag_C_bl.store(results[2])
         frag_C_br.store(results[3])
 
-        # ---- 尾部 2 个 k-tile：无 g2s，只 s2r + gemm；scale 按象限组 lazy 加载 ----
-        _kbt0 = fx.Int32(num_tiles - 2)
-        _kbt1 = fx.Int32(num_tiles - 1)
-        # buf0 = tile num_tiles-2（单缓冲 A，load-at-use）
-        if const_expr(with_scale):
-            tA_t0 = _load_sA(sA_top_baseM, _kbt0)
-            tB_l0 = _load_sB(nb_l, _kbt0)
-            tB_r0 = _load_sB(nb_r, _kbt0)
-        else:
-            tA_t0 = tB_l0 = tB_r0 = None
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        rocdl.s_barrier()
-        fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
-        fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
-        fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        begin_compute_phase()
-        do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t0, tB_l0)
-        do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t0, tB_r0)
-        end_compute_phase()
-        if const_expr(with_scale):
-            tA_b0 = _load_sA(sA_bot_baseM, _kbt0)
-        else:
-            tA_b0 = None
-        fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        begin_compute_phase()
-        do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b0, tB_l0)
-        do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b0, tB_r0)
-        end_compute_phase()
+        # # ---- 尾部 2 个 k-tile：无 g2s，只 s2r + gemm；scale 按象限组 lazy 加载 ----
+        # _kbt0 = fx.Int32(num_tiles - 2)
+        # _kbt1 = fx.Int32(num_tiles - 1)
+        # # buf0 = tile num_tiles-2（单缓冲 A，load-at-use）
+        # if const_expr(with_scale):
+        #     tA_t0 = _load_sA(sA_top_baseM, _kbt0)
+        #     tB_l0 = _load_sB(nb_l, _kbt0)
+        #     tB_r0 = _load_sB(nb_r, _kbt0)
+        # else:
+        #     tA_t0 = tB_l0 = tB_r0 = None
+        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        # rocdl.s_barrier()
+        # fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+        # fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
+        # fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
+        # rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+        # begin_compute_phase()
+        # do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t0, tB_l0)
+        # do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t0, tB_r0)
+        # end_compute_phase()
+        # if const_expr(with_scale):
+        #     tA_b0 = _load_sA(sA_bot_baseM, _kbt0)
+        # else:
+        #     tA_b0 = None
+        # fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
+        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        # begin_compute_phase()
+        # do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b0, tB_l0)
+        # do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b0, tB_r0)
+        # end_compute_phase()
 
-        # buf1 = tile num_tiles-1
-        if const_expr(with_scale):
-            tA_t1 = _load_sA(sA_top_baseM, _kbt1)
-            tB_l1 = _load_sB(nb_l, _kbt1)
-            tB_r1 = _load_sB(nb_r, _kbt1)
-        else:
-            tA_t1 = tB_l1 = tB_r1 = None
-        rocdl.s_barrier()
-        fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-        fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-        fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        begin_compute_phase()
-        do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t1, tB_l1)
-        do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t1, tB_r1)
-        end_compute_phase()
-        if const_expr(with_scale):
-            tA_b1 = _load_sA(sA_bot_baseM, _kbt1)
-        else:
-            tA_b1 = None
-        fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        begin_compute_phase()
-        do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b1, tB_l1)
-        do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b1, tB_r1)
-        end_compute_phase()
+        # # buf1 = tile num_tiles-1
+        # if const_expr(with_scale):
+        #     tA_t1 = _load_sA(sA_top_baseM, _kbt1)
+        #     tB_l1 = _load_sB(nb_l, _kbt1)
+        #     tB_r1 = _load_sB(nb_r, _kbt1)
+        # else:
+        #     tA_t1 = tB_l1 = tB_r1 = None
+        # rocdl.s_barrier()
+        # fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
+        # fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
+        # fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
+        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        # begin_compute_phase()
+        # do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t1, tB_l1)
+        # do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t1, tB_r1)
+        # end_compute_phase()
+        # if const_expr(with_scale):
+        #     tA_b1 = _load_sA(sA_bot_baseM, _kbt1)
+        # else:
+        #     tA_b1 = None
+        # fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
+        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        # begin_compute_phase()
+        # do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b1, tB_l1)
+        # do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b1, tB_r1)
+        # end_compute_phase()
 
         if wave_id < 4:
             rocdl.s_barrier()
@@ -705,8 +761,8 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
         b_deq = (b.float().view(N // 128, 128, KB, 128) * sB.view(N // 128, 1, KB, 1)).reshape(N, K)
         return a_deq @ b_deq.t()
 
-    a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
-    b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+    a = (torch.rand(M, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
+    b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
     sA, sB = _gen_scales()
     ref = _ref(a, b, sA, sB)
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
@@ -764,5 +820,5 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    run_test(M=256, N=256, K=512, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    run_test(M=M, N=N, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    run_test(M=8192, N=8192, K=8192, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
+    run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
