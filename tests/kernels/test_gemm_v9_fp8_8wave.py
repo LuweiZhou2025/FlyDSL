@@ -24,6 +24,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import fly as _fly_dialect
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 
@@ -51,6 +52,7 @@ def compile_gemm_fp8_8wave(
     permlane_epilogue=True,
     preshuffle_b=False,
     with_scale=False,
+    useTileDMA=False,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
@@ -124,6 +126,14 @@ def compile_gemm_fp8_8wave(
         B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
         c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
+        # 非 scale 版 raw LDS DMA 用的 A/B buffer resource（byte 偏移寻址）。
+        # 显式给出精确 num_records（字节）：热循环预取 kiter+3，末尾 2 个迭代会越过
+        # num_tiles，需要硬件 OOB clamp（fp8 element_bytes=1，故字节数 = 元素数）。
+        # flatten 后的 arg 是 dynamic memref，max_size=False 会退化成不 clamp 而 fault。
+        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+            argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
+        )
+        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(argB, num_records_bytes=N * K)
 
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
@@ -375,17 +385,89 @@ def compile_gemm_fp8_8wave(
         def _rd_Br(b):
             fx.copy(lds_copy_atom, _s2r_Br[b], dest_frag_B_r, pred=None)
 
+        # ---- 非 scale 版 raw scalar-pointer LDS DMA（对标 pyhip gemm_8wave_950 fp8 raw 路径）----
+        # 把每条 g2s 的 LDS 目的地址从 vector(v_readfirstlane->m0) 改为每 wave 只算一次的
+        # scalar 基址 + 编译期 static chunk 偏移，消除 v130-v147 这批地址 VGPR。
+        # 前提：本 kernel 的 _wr/_rd 与 pyhip a_lds_write/read_layout 逐字节一致，且非
+        # preshuffle 的 B 与 A 对称（grouped-row 全局 + dual-padding LDS），故 A 的 raw
+        # 路径可直接复用到 B（仅 base row 换成 bid_y*TILE_N）。
+        if const_expr(not useTileDMA):
+            _elem_bytes = element_type.width // 8  # fp8 = 1
+
+            def _dma_dst_ptr(root_view, byte_offset):
+                _pt = ir.Type.parse("!llvm.ptr<3>")
+                _rp = _fly_dialect.extract_aligned_pointer_as_index(_pt, arith._to_raw(root_view))
+                return fx.buffer_ops.get_element_ptr(_rp, byte_offset=byte_offset, elem_type=T.i8)
+
+            # pyhip 的 g2s tv（512 线程 = 64 行 × 8 k-组，每线程 1×16 fp8）
+            _g2s_tile, _g2s_tv = fx.make_layout_tv(
+                fx.make_layout((8 * 8, 8), (8, 1)),
+                fx.make_layout((1, elements_per_128b), (1, 1)),
+            )
+            _copy_g2s = fx.make_tiled_copy(buffer_copy_atom, _g2s_tv, _g2s_tile).get_slice(tid)
+            _dst_stride = _copy_g2s.partition_D(sA_t_wr[0]).stride[1].to_py_value()
+
+            # 每 wave 的 LDS 基址（dual-padding group），readfirstlane 一次
+            _a_wave_off_elems = (
+                wave_id % 2 * (8 * BLOCK_K + 16)
+                + wave_id // 2 * (2 * (8 * BLOCK_K + 16) + 32)
+            )
+            _a_wave_off_bytes = rocdl.readfirstlane(
+                T.i32, arith._to_raw(fx.Int32(_a_wave_off_elems * _elem_bytes))
+            )
+            _b_wave_off_bytes = _a_wave_off_bytes  # 非 preshuffle B 与 A 同布局
+
+            _aT_dst = [_dma_dst_ptr(sA_t_wr[0], _a_wave_off_bytes), _dma_dst_ptr(sA_t_wr[1], _a_wave_off_bytes)]
+            _aB_dst = [_dma_dst_ptr(sA_b_wr[0], _a_wave_off_bytes), _dma_dst_ptr(sA_b_wr[1], _a_wave_off_bytes)]
+            _bL_dst = [_dma_dst_ptr(sB_l_wr[0], _b_wave_off_bytes), _dma_dst_ptr(sB_l_wr[1], _b_wave_off_bytes)]
+            _bR_dst = [_dma_dst_ptr(sB_r_wr[0], _b_wave_off_bytes), _dma_dst_ptr(sB_r_wr[1], _b_wave_off_bytes)]
+
+            # 每 thread 的 (row, k) 源映射（对标 pyhip a_lane_row = tid//8）
+            _a_lane_row = tid // 8
+            _a_lane_k = tid % 8 * elements_per_128b
+            _a_local_row = _a_lane_row % 8 * (BLOCK_M // 8) + _a_lane_row // 8
+            _aT_src_base = fx.Int32(((bid_x * TILE_M + _a_local_row) * K + _a_lane_k) * _elem_bytes)
+            _aB_src_base = fx.Int32(((bid_x * TILE_M + BLOCK_M + _a_local_row) * K + _a_lane_k) * _elem_bytes)
+            _bL_src_base = fx.Int32(((bid_y * TILE_N + _a_local_row) * K + _a_lane_k) * _elem_bytes)
+            _bR_src_base = fx.Int32(((bid_y * TILE_N + BLOCK_N + _a_local_row) * K + _a_lane_k) * _elem_bytes)
+
+            def _raw_g2s(rsrc, dst_base, src_base, ki):
+                for chunk in range_constexpr(BLOCK_M // 64):
+                    _dp = fx.buffer_ops.get_element_ptr(
+                        dst_base,
+                        static_byte_offset=chunk * _dst_stride * _elem_bytes,
+                        elem_type=T.i8,
+                    )
+                    _so = src_base + fx.Int32(
+                        ki * BLOCK_K * _elem_bytes + chunk * 8 * K * _elem_bytes
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc, _dp, fx.Int32(16), _so, fx.Int32(0), fx.Int32(0), fx.Int32(0)
+                    )
+
         def _ld_At(b, ki):
-            fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[b])
+            if const_expr(not useTileDMA):
+                _raw_g2s(a_dma_rsrc, _aT_dst[b], _aT_src_base, ki)
+            else:
+                fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[b])
 
         def _ld_Ab(b, ki):
-            fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[b])
+            if const_expr(not useTileDMA):
+                _raw_g2s(a_dma_rsrc, _aB_dst[b], _aB_src_base, ki)
+            else:
+                fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[b])
 
         def _ld_Bl(b, ki):
-            fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[b])
+            if const_expr(not useTileDMA):
+                _raw_g2s(b_dma_rsrc, _bL_dst[b], _bL_src_base, ki)
+            else:
+                fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[b])
 
         def _ld_Br(b, ki):
-            fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[b])
+            if const_expr(not useTileDMA):
+                _raw_g2s(b_dma_rsrc, _bR_dst[b], _bR_src_base, ki)
+            else:
+                fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[b])
 
   
         rocdl.sched_barrier(0)
@@ -579,63 +661,6 @@ def compile_gemm_fp8_8wave(
         frag_C_bl.store(results[2])
         frag_C_br.store(results[3])
 
-        # # ---- 尾部 2 个 k-tile：无 g2s，只 s2r + gemm；scale 按象限组 lazy 加载 ----
-        # _kbt0 = fx.Int32(num_tiles - 2)
-        # _kbt1 = fx.Int32(num_tiles - 1)
-        # # buf0 = tile num_tiles-2（单缓冲 A，load-at-use）
-        # if const_expr(with_scale):
-        #     tA_t0 = _load_sA(sA_top_baseM, _kbt0)
-        #     tB_l0 = _load_sB(nb_l, _kbt0)
-        #     tB_r0 = _load_sB(nb_r, _kbt0)
-        # else:
-        #     tA_t0 = tB_l0 = tB_r0 = None
-        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        # rocdl.s_barrier()
-        # fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
-        # fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
-        # fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-        # rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-        # begin_compute_phase()
-        # do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t0, tB_l0)
-        # do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t0, tB_r0)
-        # end_compute_phase()
-        # if const_expr(with_scale):
-        #     tA_b0 = _load_sA(sA_bot_baseM, _kbt0)
-        # else:
-        #     tA_b0 = None
-        # fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
-        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        # begin_compute_phase()
-        # do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b0, tB_l0)
-        # do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b0, tB_r0)
-        # end_compute_phase()
-
-        # # buf1 = tile num_tiles-1
-        # if const_expr(with_scale):
-        #     tA_t1 = _load_sA(sA_top_baseM, _kbt1)
-        #     tB_l1 = _load_sB(nb_l, _kbt1)
-        #     tB_r1 = _load_sB(nb_r, _kbt1)
-        # else:
-        #     tA_t1 = tB_l1 = tB_r1 = None
-        # rocdl.s_barrier()
-        # fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-        # fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-        # fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        # begin_compute_phase()
-        # do_gemm(frag_C_tl, frag_B_l, frag_A_t, tA_t1, tB_l1)
-        # do_gemm(frag_C_tr, frag_B_r, frag_A_t, tA_t1, tB_r1)
-        # end_compute_phase()
-        # if const_expr(with_scale):
-        #     tA_b1 = _load_sA(sA_bot_baseM, _kbt1)
-        # else:
-        #     tA_b1 = None
-        # fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
-        # rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-        # begin_compute_phase()
-        # do_gemm(frag_C_bl, frag_B_l, frag_A_t, tA_b1, tB_l1)
-        # do_gemm(frag_C_br, frag_B_r, frag_A_t, tA_b1, tB_r1)
-        # end_compute_phase()
 
         if wave_id < 4:
             rocdl.s_barrier()
@@ -738,7 +763,7 @@ def _load_shuffle_weight():
 
 
 def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with_scale=False,
-             run_count=50, data_clones=32):
+             run_count=50, data_clones=32, useTiledDMA=False):
     shuffle_weight = _load_shuffle_weight() if preshuffle_b else None
 
     def _shuffle_b(x):
@@ -772,17 +797,20 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
             sA.view(-1), sB.view(-1), M, stream)
 
     launcher = compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, N, K, permlane_epilogue=permlane_output,
-                                      preshuffle_b=preshuffle_b, with_scale=with_scale)
+                                      preshuffle_b=preshuffle_b, with_scale=with_scale, useTileDMA=useTiledDMA)
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     kernel(*args)
     torch.cuda.synchronize()
 
     abs_err = (out.float() - ref).abs()
-    rel = abs_err / (ref.abs() + 1e-3)
-    atol = 0.02 * ref.abs().max().item() + 0.01
-    is_correct = torch.allclose(out.float(), ref, rtol=0.05, atol=atol)
-    print(f"####M={M} N={N} K={K} 8wave preshuffle_b={preshuffle_b} with_scale={with_scale} "
-          f"is_correct={is_correct} max_abs={abs_err.max().item():.3f} max_rel={rel.max().item():.3f}")
+    # fp8×fp8→f32 累加对整数输入是精确的：与 f32 ref 的 diff 只来自输出转 bf16 的舍入。
+    # 与「bf16 舍入后的 ref」比较应 ≈0（非 scale 时用来验证计算零误差）。
+    diff = pyhip.calc_diff(out.float(), ref)
+    diff_bf16ref = pyhip.calc_diff(out.float(), ref.to(torch.bfloat16).float())
+    is_correct = diff < 0.01
+    print(f"####M={M} N={N} K={K} 8wave preshuffle_b={preshuffle_b} with_scale={with_scale}, useTiledDMA={useTiledDMA} "
+          f"is_correct={is_correct} calc_diff(vs f32 ref)={diff:.6f} "
+          f"calc_diff(vs bf16 ref)={diff_bf16ref:.6f} max_abs={abs_err.max().item():.3f}")
 
     if not perf:
         return is_correct
