@@ -25,7 +25,61 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import fly as _fly_dialect
+from flydsl._mlir.dialects import scf as _mlir_scf
 from flydsl.compiler.ast_rewriter import ASTRewriter
+
+
+def wg_buffer_load_lds_fp32(sA_ptr, gA, nelems, num_waves, offset=0):
+    """fp32 三段式 global->LDS DMA(LDS 恰好 = nelems 个 fp32, 不 padding)。对标 pyhip
+    wg_buffer_load_lds：把一段连续 fp32 从 global 搬入 LDS。offset = 本段在 gA 里的起点。
+      1) DWORDx4 满轮  2) DWORD 满轮  3) DWORD 条件 lane(exec-mask)。gA 单一 resource。"""
+    tid = fx.thread_idx.x
+    wave_id = tid // 64
+    WARP = 64
+    LOAD4 = 4
+    total = num_waves * WARP
+    step4 = total * LOAD4
+    n1 = nelems // step4
+    load1 = n1 * step4
+    rest1 = nelems - load1
+    n2 = rest1 // total
+    load2 = n2 * total
+    part3 = rest1 - load2
+
+    if const_expr(n1 > 0):
+        dma128 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        wave_off4 = fx.rocdl.readfirstlane(fx.Int32.ir_type, wave_id * (WARP * LOAD4))
+        lds4 = fx.add_offset(sA_ptr, wave_off4)
+        for i in range_constexpr(n1):
+            chunk = i * total + tid
+            dst = fx.make_view(lds4, fx.make_layout(1, 1))
+            src = fx.slice(gA, (None, fx.Int32(offset + chunk * LOAD4)))
+            fx.copy(dma128, src, dst)
+            lds4 = fx.add_offset(lds4, step4)
+
+    if const_expr(rest1 > 0):
+        dma32 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+        wave_off1 = fx.rocdl.readfirstlane(fx.Int32.ir_type, wave_id * WARP)
+        lds1 = fx.add_offset(sA_ptr, wave_off1)
+        lds1 = fx.add_offset(lds1, load1)
+        if const_expr(n2 > 0):
+            for j in range_constexpr(n2):
+                idx = load1 + j * total + tid
+                dst = fx.make_view(lds1, fx.make_layout(1, 1))
+                src = fx.slice(gA, (None, fx.Int32(offset + idx)))
+                fx.copy(dma32, src, dst)
+                lds1 = fx.add_offset(lds1, total)
+        if const_expr(part3 > 0):
+            cond = arith.cmpi(arith.CmpIPredicate.ult, tid, arith.constant(part3, type=T.i32))
+            if_op = _mlir_scf.IfOp(cond, [], has_else=False)
+            if len(if_op.regions[0].blocks) == 0:
+                if_op.regions[0].blocks.append(*[])
+            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                idx = load1 + load2 + tid
+                dst = fx.make_view(lds1, fx.make_layout(1, 1))
+                src = fx.slice(gA, (None, fx.Int32(offset + idx)))
+                fx.copy(dma32, src, dst)
+                _mlir_scf.YieldOp([])
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -103,6 +157,12 @@ def compile_gemm_fp8_8wave(
         b_l1: fx.Array[Float8E4M3FN, 16896, 16]
         b_r0: fx.Array[Float8E4M3FN, 16896, 16]
         b_r1: fx.Array[Float8E4M3FN, 16896, 16]
+        # ---- scale LDS (对标 pyhip use_f32_blockscales_128) ----
+        # scaleA tic-toc: 每个 k-block 的 wg_M=TILE_M 个 per-token scale (fp32)
+        s_a0: fx.Array[Float32, TILE_M, 16]
+        s_a1: fx.Array[Float32, TILE_M, 16]
+        # scaleB 全部: [wg_N//128, K//128] = [TILE_N//128, K//128] 个 fp32, 一次性预加载
+        s_b: fx.Array[Float32, (TILE_N // 128) * (K // 128), 16]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def gemm_kernel(argA: fx.Tensor, argB: fx.Tensor, argC: fx.Tensor,
@@ -258,7 +318,12 @@ def compile_gemm_fp8_8wave(
         frag_C_tr = thr_mma.make_fragment_C(bC_tr)
         frag_C_bl = thr_mma.make_fragment_C(bC_bl)
         frag_C_br = thr_mma.make_fragment_C(bC_br)
-
+        if const_expr(with_scale):
+            frag_P = thr_mma.make_fragment_C(bC_tl)   # 临时 C fragment: 存未反量化的 MFMA 结果
+            # 固定 scale 寄存器(对标 pyhip mfma_scaleA[nrM], mfma_scaleB[num_scaleB])：
+            # 循环里就地覆盖、就地读，避免每次现造 fragment / 用 Python list 长活。
+            frag_sA = fx.make_rmem_tensor(fx.make_layout(TILE_M // 64, 1), fx.Float32)  # 4 个
+            frag_sB = fx.make_rmem_tensor(fx.make_layout(TILE_N // 128, 1), fx.Float32)  # 2 个
 
         # ==== block-scale (a8w8) 设置：A per-token group-128，B block-wise 128x128 ====
         # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * (fp8 partial over k-block kb)。
@@ -270,33 +335,72 @@ def compile_gemm_fp8_8wave(
         N_REP = TILE_N // 128
         if const_expr(with_scale):
             KB = K // 128
-            sA_rsrc = fx.buffer_ops.create_buffer_resource(argScaleA, max_size=True)
-            sB_rsrc = fx.buffer_ops.create_buffer_resource(argScaleB, max_size=True)
+            SCALE_WAVES = 512 // 64  # 8 waves 参与 LDS scale DMA
             lane_id = tid % 64
             wave_m = wave_id // 4
-            sA_top_baseM = bid_x * TILE_M + wave_m * 16 + lane_id % 16
-            sA_bot_baseM = sA_top_baseM + TILE_M // 2
             nb_l = bid_y * (TILE_N // 128)
             nb_r = nb_l + 1
-            frag_P = thr_mma.make_fragment_C(bC_tl)
+            uni_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
 
-            def _load_sA(baseM, kb):
-                base_off = baseM * KB + kb
-                return [
-                    fx.Float32(fx.buffer_ops.buffer_load(sA_rsrc, base_off + m0 * 32 * KB, vec_width=1))
-                    for m0 in range_constexpr(M_REP)
-                ]
+            # scaleA 期望 [KB, M] (k-major): 每个 k-block 的 M 个 per-token scale 连续,
+            # 便于 wg_buffer_load_lds_fp32 一段连续搬进 LDS。
+            _sa_g = fx.rocdl.make_buffer_tensor(
+                fx.make_view(fx.get_iter(argScaleA), fx.make_layout(1 << 22, 1)),
+                max_size=False, num_records_bytes=fx.Int64(KB) * fx.Int64(M) * fx.Int64(4),
+            )
+            _sa_g = fx.logical_divide(_sa_g, fx.make_layout(1, 1))
+            # scaleB [N//128, KB]; 本 block 的 [TILE_N//128, KB] 是连续段。
+            _sb_g = fx.rocdl.make_buffer_tensor(
+                fx.make_view(fx.get_iter(argScaleB), fx.make_layout(1 << 20, 1)),
+                max_size=False, num_records_bytes=fx.Int64(N // 128) * fx.Int64(KB) * fx.Int64(4),
+            )
+            _sb_g = fx.logical_divide(_sb_g, fx.make_layout(1, 1))
 
-            def _load_sB(nb, kb):
-                return fx.Float32(fx.buffer_ops.buffer_load(sB_rsrc, nb * KB + kb, vec_width=1))
+            _sA_lds = [lds.s_a0.ptr, lds.s_a1.ptr]
 
-        def do_gemm(frag_C, frag_B, frag_A, sA_list, sB):
+            # 对标 pyhip vm_load_scaleA: 把第 kb 个 k-block 的 TILE_M 个 scaleA 搬进 tic/toc LDS。
+            def _vm_load_scaleA(buf, kb):
+                wg_buffer_load_lds_fp32(_sA_lds[buf], _sa_g, TILE_M, SCALE_WAVES,
+                                        offset=kb * M + bid_x * TILE_M)
+
+            # 对标 pyhip wg_buffer_load_lds(lds_scaleB,...): 一次性把整块 scaleB 搬进 LDS。
+            def _load_scaleB_all():
+                wg_buffer_load_lds_fp32(lds.s_b.ptr, _sb_g, (TILE_N // 128) * KB, SCALE_WAVES,
+                                        offset=nb_l * KB)
+
+            # 对标 pyhip ds_read_scaleA: 从 LDS 读 per-lane m0 值(匹配 C fragment 行映射
+            # row = quadrant*128 + m0*32 + wave_m*16 + lane%16)。buf: tic/toc; half: 0上/1下。
+            # per-m0 读 (stride=32 fp32) 后 store 进固定的 frag_sA(4 个)，循环复用同 4 个寄存器。
+            def _load_sA(buf, half):
+                base = half * (TILE_M // 2) + wave_m * 16 + lane_id % 16
+                vals = []
+                for m0 in range_constexpr(M_REP):
+                    lv = fx.make_view(fx.add_offset(_sA_lds[buf], base + m0 * 32), fx.make_layout(1, 1))
+                    tmp = fx.make_fragment_like(lv)
+                    fx.copy(uni_scale, lv, tmp)
+                    vals.append(Vector(tmp.load())[0])
+                fx.memref_store_vec(Vector.from_elements(vals, fx.Float32), frag_sA)
+
+            # 对标 pyhip ds_read_scaleB: 读 nb_l/nb_r 两个 (stride=KB) 后 store 进固定的 frag_sB(2 个)。
+            # frag_sB[nb_local] = scaleB[nb_l + nb_local, kb]。nb_local ∈ [0, TILE_N//128)。
+            def _load_sB(kb):
+                vals = []
+                for nb in range_constexpr(N_REP):
+                    lv = fx.make_view(fx.add_offset(lds.s_b.ptr, nb * KB + kb), fx.make_layout(1, 1))
+                    tmp = fx.make_fragment_like(lv)
+                    fx.copy(uni_scale, lv, tmp)
+                    vals.append(Vector(tmp.load())[0])
+                fx.memref_store_vec(Vector.from_elements(vals, fx.Float32), frag_sB)
+
+        def do_gemm(frag_C, frag_B, frag_A, nb_local=0):
             if const_expr(with_scale):
-                # 每 k-block 先算无 scale partial(frag_P)，再按 scaleA[m0]*scaleB FMA 累加进 frag_C。
+                # 每 k-block 先算无 scale partial(frag_P)，再按 scaleA[m0]*scaleB[nb] FMA 累加进 frag_C。
                 frag_P.fill(0)
                 fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
+                sA_vec = Vector(fx.memref_load_vec(frag_sA))
+                sB = Vector(fx.memref_load_vec(frag_sB))[nb_local]
                 for m0 in range_constexpr(M_REP):
-                    s = sA_list[m0] * sB
+                    s = sA_vec[m0] * sB
                     for n0 in range_constexpr(N_REP):
                         cs = frag_C[None, n0, m0]
                         cs.store(cs.load() + frag_P[None, n0, m0].load() * s)
@@ -471,6 +575,9 @@ def compile_gemm_fp8_8wave(
 
   
         rocdl.sched_barrier(0)
+        if const_expr(with_scale):
+            _load_scaleB_all()          # 整块 scaleB 一次性进 LDS(对标 pyhip wg_buffer_load_lds)
+            _vm_load_scaleA(0, 0)       # scaleA k=0 -> tic (对标 pyhip vm_load_scaleA(lds_scaleA[tic],0))
         _ld_Bl(0, 0)
         rocdl.sched_barrier(0)
         _ld_At(0, 0)
@@ -502,11 +609,15 @@ def compile_gemm_fp8_8wave(
         rocdl.sched_barrier(0)
         _ld_Br(1, 1)
         rocdl.sched_barrier(0)
+        if const_expr(with_scale):
+            _vm_load_scaleA(1, 1)       # scaleA k=1 -> toc (对标 pyhip vm_load_scaleA(lds_scaleA[toc],1))
         
         vmcnt = vm_load_cnt_a + vm_load_cnt_b*2
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
 
         acc_init = [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
+        
+        
         for kidx, states in range(0, num_tiles, 2, init=acc_init):
             frag_C_tl.store(states[0])
             frag_C_tr.store(states[1])
@@ -525,28 +636,28 @@ def compile_gemm_fp8_8wave(
                 rocdl.sched_barrier(0)
         
                 begin_compute_phase()
-                do_gemm(frag_C_tl, frag_B_l, frag_A_t, None, None)
+                do_gemm(frag_C_tl, frag_B_l, frag_A_t)
                 end_compute_phase()
                 
                 _rd_Br(tick)
                 _ld_At(tick, kiter+2)
 
                 begin_compute_phase()
-                do_gemm(frag_C_tr, frag_B_r, frag_A_t, None, None)
+                do_gemm(frag_C_tr, frag_B_r, frag_A_t)
                 end_compute_phase()
 
                 _rd_Ab(tick)
                 _ld_Bl(tick, kiter+2)
 
                 begin_compute_phase()
-                do_gemm(frag_C_bl, frag_B_l, frag_A_t, None, None)
+                do_gemm(frag_C_bl, frag_B_l, frag_A_t)
                 end_compute_phase()
 
                 _ld_Br(tick, kiter+2)
                 rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b*2))
                 
                 begin_compute_phase()
-                do_gemm(frag_C_br, frag_B_r, frag_A_t, None, None)
+                do_gemm(frag_C_br, frag_B_r, frag_A_t)
                 end_compute_phase()
                 
                 
@@ -560,102 +671,61 @@ def compile_gemm_fp8_8wave(
                 rocdl.sched_barrier(0)
         
                 begin_compute_phase()
-                do_gemm(frag_C_tl, frag_B_l, frag_A_t, None, None)
+                do_gemm(frag_C_tl, frag_B_l, frag_A_t)
                 end_compute_phase()
                 
                 _rd_Br(tick)
                 _ld_At(tick, kiter+3)
 
                 begin_compute_phase()
-                do_gemm(frag_C_tr, frag_B_r, frag_A_t, None, None)
+                do_gemm(frag_C_tr, frag_B_r, frag_A_t)
                 end_compute_phase()
 
                 _rd_Ab(tick)
                 _ld_Bl(tick, kiter+3)
 
                 begin_compute_phase()
-                do_gemm(frag_C_bl, frag_B_l, frag_A_t, None, None)
+                do_gemm(frag_C_bl, frag_B_l, frag_A_t)
                 end_compute_phase()
 
                 _ld_Br(tick, kiter+3)
                 rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b*2))
                 
                 begin_compute_phase()
-                do_gemm(frag_C_br, frag_B_r, frag_A_t, None, None)
+                do_gemm(frag_C_br, frag_B_r, frag_A_t)
                 end_compute_phase()
+            else:
+                # ---- scale 版(correctness-first, full-drain): 每 tile 先算无 scale partial ----
+                # (frag_P), 再从 LDS 读 scaleA/scaleB 做 dequant 累加进 frag_C。scaleA tic-toc:
+                # tile kidx+t 用 s_a[t](prologue 装 k0/k1); 本轮末尾预取 kidx+2+t 回同一 buffer。
+                for t in range_constexpr(2):
+                    _rd_Bl(t)
+                    _rd_Br(t)
+                    _rd_At(t)
+                    _load_sB(kiter + t)          # 填满固定 frag_sB(nb_l, nb_r)
+                    _load_sA(t, 0)               # 填满固定 frag_sA(上半)
+                    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+                    begin_compute_phase()
+                    do_gemm(frag_C_tl, frag_B_l, frag_A_t, 0)
+                    do_gemm(frag_C_tr, frag_B_r, frag_A_t, 1)
+                    end_compute_phase()
+                    _rd_Ab(t)
+                    _load_sA(t, 1)               # 覆盖 frag_sA(下半)
+                    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+                    begin_compute_phase()
+                    do_gemm(frag_C_bl, frag_B_l, frag_A_t, 0)
+                    do_gemm(frag_C_br, frag_B_r, frag_A_t, 1)
+                    end_compute_phase()
+                    # 预取下一 tile 的 A/B + scaleA 回同一 tic-toc buffer
+                    rocdl.s_barrier()
+                    _ld_At(t, kiter + 2 + t)
+                    _ld_Ab(t, kiter + 2 + t)
+                    _ld_Bl(t, kiter + 2 + t)
+                    _ld_Br(t, kiter + 2 + t)
+                    _vm_load_scaleA(t, kiter + 2 + t)
+                    rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+                    rocdl.s_barrier()
             results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
-                
-            # else:
-
-            #     # ===== 单缓冲 A + ping-pong B（象限序 TL,TR,BL,BR）；scale 按象限组 lazy 加载 =====
-            #     # 每组仅持 4(scaleA)+2(scaleB) 个 SSA，避免像预取 16 个那样长期占用寄存器。
-            #     # buf0 = tile kidx
-            #     if const_expr(with_scale):
-            #         sA_t0 = _load_sA(sA_top_baseM, kiter)
-            #         sB_l0 = _load_sB(nb_l, kiter)
-            #         sB_r0 = _load_sB(nb_r, kiter)
-            #     else:
-            #         sA_t0 = sB_l0 = sB_r0 = None
-            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            #     rocdl.s_barrier()
-            #     fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
-            #     fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
-            #     fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
-            #     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            #     begin_compute_phase()
-            #     do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t0, sB_l0)
-            #     do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t0, sB_r0)
-            #     end_compute_phase()
-            #     if const_expr(with_scale):
-            #         sA_b0 = _load_sA(sA_bot_baseM, kiter)
-            #     else:
-            #         sA_b0 = None
-            #     fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_t, pred=None)
-            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            #     begin_compute_phase()
-            #     do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b0, sB_l0)
-            #     do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b0, sB_r0)
-            #     end_compute_phase()
-            #     rocdl.s_barrier()
-            #     fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            #     fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            #     fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            #     fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
-
-            #     # buf1 = tile kidx+1
-            #     if const_expr(with_scale):
-            #         sA_t1 = _load_sA(sA_top_baseM, kiter + 1)
-            #         sB_l1 = _load_sB(nb_l, kiter + 1)
-            #         sB_r1 = _load_sB(nb_r, kiter + 1)
-            #     else:
-            #         sA_t1 = sB_l1 = sB_r1 = None
-            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            #     rocdl.s_barrier()
-            #     fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
-            #     fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
-            #     fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
-            #     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            #     begin_compute_phase()
-            #     do_gemm(frag_C_tl, frag_B_l, frag_A_t, sA_t1, sB_l1)
-            #     do_gemm(frag_C_tr, frag_B_r, frag_A_t, sA_t1, sB_r1)
-            #     end_compute_phase()
-            #     if const_expr(with_scale):
-            #         sA_b1 = _load_sA(sA_bot_baseM, kiter + 1)
-            #     else:
-            #         sA_b1 = None
-            #     fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_t, pred=None)
-            #     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
-            #     begin_compute_phase()
-            #     do_gemm(frag_C_bl, frag_B_l, frag_A_t, sA_b1, sB_l1)
-            #     do_gemm(frag_C_br, frag_B_r, frag_A_t, sA_b1, sB_r1)
-            #     end_compute_phase()
-            #     rocdl.s_barrier()
-            #     fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            #     fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            #     fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            #     fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
-            #     results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
-
         frag_C_tl.store(results[0])
         frag_C_tr.store(results[1])
         frag_C_bl.store(results[2])
@@ -793,8 +863,10 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     weight = _shuffle_b(b)
     stream = torch.cuda.current_stream()
+    # kernel 期望 scaleA 为 [KB, M] (k-major): 每个 k-block 的 M 个 per-token scale 连续。
+    sA_arg = (sA.t().contiguous() if with_scale else sA).view(-1)
     args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1),
-            sA.view(-1), sB.view(-1), M, stream)
+            sA_arg, sB.view(-1), M, stream)
 
     launcher = compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, N, K, permlane_epilogue=permlane_output,
                                       preshuffle_b=preshuffle_b, with_scale=with_scale, useTileDMA=useTiledDMA)
@@ -848,5 +920,6 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    run_test(M=8192, N=8192, K=8192, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
-    run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
+    run_test(M=8192, N=8192, K=8192, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    # run_test(M=8192, N=8192, K=8192, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    # run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
