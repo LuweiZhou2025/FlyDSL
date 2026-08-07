@@ -345,13 +345,14 @@ def compile_gemm_fp8_8wave(
                     scales.append(Vec(scale_frag.load())[0])
                 return scales
 
-        def do_gemm(frag_C, frag_B, frag_A, prev_fifo_scale=None):
+        def do_gemm(frag_C, frag_B, frag_A, mfma_scaleA=None, current_scale=None, prev_scale=None):
             if const_expr(with_scale):
                 # 用上一 phase 的 scale slot 消费 FIFO，再生成当前 partial。
                 for m0 in range_constexpr(M_REP):
+                    current_scale[m0] = mfma_scaleA[m0]
                     for n0 in range_constexpr(N_REP):
                         cs = frag_C[None, n0, m0]
-                        cs.store(cs.load() + frag_P[None, n0, m0].load() * prev_fifo_scale[m0])
+                        cs.store(cs.load() + frag_P[None, n0, m0].load() * prev_scale[m0])
                 frag_P.fill(0)
                 fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
             else:
@@ -586,6 +587,8 @@ def compile_gemm_fp8_8wave(
             fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0),
             fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0),
         ]
+
+        
         for kidx, states in range(0, num_tiles, 2, init=acc_init):
             frag_C_tl.store(states[0])
             frag_C_tr.store(states[1])
@@ -597,23 +600,20 @@ def compile_gemm_fp8_8wave(
                 fifo_scale_1 = [states[9], states[10], states[11], states[12]]
             kiter = fx.Int32(kidx)
 
+
             if const_expr(True):
                 tick = 0
                 tock = 1
                 _rd_Bl(tick)
                 _rd_At(tick)
-                _ac_Ab(tock, kiter+1)
-                rocdl.sched_barrier(0)
                 if const_expr(with_scale):
-                    rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=a_vmem, lgkmcnt=0))
-                else:
-                    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-                rocdl.sched_barrier(0)
+                    mfma_scaleA = _rd_scale_a(tick, 0)
+                _ac_Ab(tock, kiter+1)      
+                rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = _rd_scale_a(tick, 0)
-                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_1)
+                    do_gemm(frag_C_br, frag_B_l, frag_A_t, mfma_scaleA, fifo_scale_0, fifo_scale_1)
                 else:
                     do_gemm(frag_C_br, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -624,58 +624,54 @@ def compile_gemm_fp8_8wave(
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = _rd_scale_a(tick, 0)
-                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_0)
+                    do_gemm(frag_C_tl, frag_B_r, frag_A_t,  mfma_scaleA, fifo_scale_1, fifo_scale_0)
                 else:
                     do_gemm(frag_C_tl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
 
                 _rd_Ab(tick)
+                if const_expr(with_scale):
+                    mfma_scaleA = _rd_scale_a(tick, 1)
                 _ac_Bl(tick, kiter+2)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = _rd_scale_a(tick, 1)
-                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_1)
+                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, mfma_scaleA, fifo_scale_0, fifo_scale_1)
                 else:
                     do_gemm(frag_C_tr, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
 
                 _ac_Br(tick, kiter+2)
+                if const_expr(with_scale):
+                    _ac_scale_a(tick, kiter + 2)
                 rocdl.s_waitcnt(encode_waitcnt_950(
                     vmcnt=vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scale_a
                 ))
                 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = _rd_scale_a(tick, 1)
-                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_0)
+                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, mfma_scaleA, fifo_scale_1, fifo_scale_0)
                 else:
                     do_gemm(frag_C_bl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
-                if const_expr(with_scale):
-                    _ac_scale_a(tick, kiter + 2)
-                
+
                 
                 tick = 1
                 tock = 0
+            
                 _rd_Bl(tick)
                 _rd_At(tick)
-                _ac_Ab(tock, kiter+2)
-                rocdl.sched_barrier(0)
                 if const_expr(with_scale):
-                    rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=a_vmem, lgkmcnt=0))
-                else:
-                    rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-                rocdl.sched_barrier(0)
+                    mfma_scaleA = _rd_scale_a(tick, 0)
+                _ac_Ab(tock, kiter+2)      
+                rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = _rd_scale_a(tick, 0)
-                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_1)
+                    do_gemm(frag_C_br, frag_B_l, frag_A_t, mfma_scaleA, fifo_scale_0, fifo_scale_1)
                 else:
                     do_gemm(frag_C_br, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -686,43 +682,48 @@ def compile_gemm_fp8_8wave(
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = _rd_scale_a(tick, 0)
-                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_0)
+                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, mfma_scaleA, fifo_scale_1, fifo_scale_0)
                 else:
                     do_gemm(frag_C_tl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
 
                 _rd_Ab(tick)
+                if const_expr(with_scale):
+                    mfma_scaleA = _rd_scale_a(tick, 1)
                 _ac_Bl(tick, kiter+3)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = _rd_scale_a(tick, 1)
-                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_1)
+                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, mfma_scaleA, fifo_scale_0, fifo_scale_1)
                 else:
                     do_gemm(frag_C_tr, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
 
                 _ac_Br(tick, kiter+3)
+                if const_expr(with_scale):
+                    _ac_scale_a(tick, kiter+3)
                 rocdl.s_waitcnt(encode_waitcnt_950(
                     vmcnt=vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scale_a
                 ))
                 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = _rd_scale_a(tick, 1)
-                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_0)
+                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, mfma_scaleA, fifo_scale_1, fifo_scale_0)
                 else:
                     do_gemm(frag_C_bl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
                 end_compute_phase()
-                if const_expr(with_scale):
-                    _ac_scale_a(tick, kiter + 3)
+
+
+
+
+
             if const_expr(not with_scale):
                 fifo_scale_0 = [fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0)]
                 fifo_scale_1 = [fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0)]
+    
             results = yield [
                 frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load(),
                 frag_P.load(),
