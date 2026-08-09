@@ -63,11 +63,6 @@ def compile_gemm_fp8_8wave(
     scaleA_stride = K // 128
     scaleB_rows = TILE_N // 128
     scaleB_elems = scaleB_rows * scaleA_stride
-    if with_scale:
-        assert scaleB_elems < 512 * 4, (
-            "ScaleB LDS staging currently supports only DWORD loads; "
-            "DWORDx4 is required for 2048 or more elements"
-        )
 
     def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
@@ -199,40 +194,65 @@ def compile_gemm_fp8_8wave(
                 ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(scale_b_lds)
             )
             total_lanes = 512
-            rounds_32b = scaleB_elems // total_lanes
+            elems_per_128b_scale = 4
+            elems_per_round_128b = total_lanes * elems_per_128b_scale
+            rounds_128b = scaleB_elems // elems_per_round_128b
+            loaded_128b = rounds_128b * elems_per_round_128b
+            remaining_elems = scaleB_elems - loaded_128b
+            rounds_32b = remaining_elems // total_lanes
             loaded_32b = rounds_32b * total_lanes
-            tail_elems = scaleB_elems - loaded_32b
+            tail_elems = remaining_elems - loaded_32b
             scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
-            lane_byte_offset_32b = fx.Int32(tid * 4)
-            wave_offset_32b = rocdl.readfirstlane(
-                T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
-            )
 
-            for copy_round in range_constexpr(rounds_32b):
-                round_elem_offset = copy_round * total_lanes
-                scale_b_dst = fx.buffer_ops.get_element_ptr(
-                    scale_b_root_ptr,
-                    byte_offset=wave_offset_32b + round_elem_offset * 4,
-                    elem_type=T.i8,
+            if const_expr(rounds_128b > 0):
+                lane_byte_offset_128b = fx.Int32(tid * 16)
+                wave_offset_128b = rocdl.readfirstlane(
+                    T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 16))
                 )
-                rocdl.raw_ptr_buffer_load_lds(
-                    sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
-                    fx.Int32(scale_b_global_base + round_elem_offset * 4),
-                    fx.Int32(0), fx.Int32(0),
-                )
-
-            if const_expr(tail_elems > 0):
-                if tid < tail_elems:
+                for copy_round in range_constexpr(rounds_128b):
+                    round_elem_offset = copy_round * elems_per_round_128b
                     scale_b_dst = fx.buffer_ops.get_element_ptr(
                         scale_b_root_ptr,
-                        byte_offset=wave_offset_32b + loaded_32b * 4,
+                        byte_offset=wave_offset_128b + round_elem_offset * 4,
+                        elem_type=T.i8,
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        sB_rsrc, scale_b_dst, fx.Int32(16), lane_byte_offset_128b,
+                        fx.Int32(scale_b_global_base + round_elem_offset * 4),
+                        fx.Int32(0), fx.Int32(0),
+                    )
+
+            if const_expr(remaining_elems > 0):
+                lane_byte_offset_32b = fx.Int32(tid * 4)
+                wave_offset_32b = rocdl.readfirstlane(
+                    T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
+                )
+                for copy_round in range_constexpr(rounds_32b):
+                    round_elem_offset = loaded_128b + copy_round * total_lanes
+                    scale_b_dst = fx.buffer_ops.get_element_ptr(
+                        scale_b_root_ptr,
+                        byte_offset=wave_offset_32b + round_elem_offset * 4,
                         elem_type=T.i8,
                     )
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
-                        fx.Int32(scale_b_global_base + loaded_32b * 4),
+                        fx.Int32(scale_b_global_base + round_elem_offset * 4),
                         fx.Int32(0), fx.Int32(0),
                     )
+
+                if const_expr(tail_elems > 0):
+                    if tid < tail_elems:
+                        tail_elem_offset = loaded_128b + loaded_32b
+                        scale_b_dst = fx.buffer_ops.get_element_ptr(
+                            scale_b_root_ptr,
+                            byte_offset=wave_offset_32b + tail_elem_offset * 4,
+                            elem_type=T.i8,
+                        )
+                        rocdl.raw_ptr_buffer_load_lds(
+                            sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
+                            fx.Int32(scale_b_global_base + tail_elem_offset * 4),
+                            fx.Int32(0), fx.Int32(0),
+                        )
 
             rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
             rocdl.s_barrier()
@@ -474,13 +494,15 @@ def compile_gemm_fp8_8wave(
                             _llvm.extractvalue(T.vec(4, T.f32), result, [4])
                         )
             else:
-                # 单级 FIFO：先消费上一 phase 的 partial，再用当前 MFMA 覆盖 FIFO。
-                for m0 in range_constexpr(M_REP):
-                    for n0 in range_constexpr(N_REP):
-                        cs = frag_C[None, n0, m0]
-                        cs.store(cs.load() + frag_P[None, n0, m0].load())
-                frag_P.fill(0)
-                fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
+                # # 单级 FIFO：先消费上一 phase 的 partial，再用当前 MFMA 覆盖 FIFO。
+                # for m0 in range_constexpr(M_REP):
+                #     for n0 in range_constexpr(N_REP):
+                #         cs = frag_C[None, n0, m0]
+                #         cs.store(cs.load() + frag_P[None, n0, m0].load())
+                # frag_P.fill(0)
+                # fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
+
+                fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
 
         def schedule_fifo_valu_mfma(group_id):
             if const_expr(not with_scale):
@@ -1135,11 +1157,10 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    # run_test(M=16384, N=3584, K=6144, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    # run_test(M=16384, N=3584, K=6144, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    # run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
-    run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
-    run_test(M=8192, N=8192, K=8192, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    
+    K = 65536
+    # run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
+    run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
 
 
 
