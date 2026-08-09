@@ -60,6 +60,14 @@ def compile_gemm_fp8_8wave(
     BLOCK_K = TILE_K
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
+    scaleA_stride = K // 128
+    scaleB_rows = TILE_N // 128
+    scaleB_elems = scaleB_rows * scaleA_stride
+    if with_scale:
+        assert scaleB_elems < 512 * 4, (
+            "ScaleB LDS staging currently supports only DWORD loads; "
+            "DWORDx4 is required for 2048 or more elements"
+        )
 
     def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
@@ -105,6 +113,7 @@ def compile_gemm_fp8_8wave(
         #scale a ping-pong LDS        
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
+        scale_b: fx.Array[Float32, (TILE_N // 128) * (K // 128), 4]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def gemm_kernel(argA: fx.Tensor, argB: fx.Tensor, argC: fx.Tensor,
@@ -172,6 +181,62 @@ def compile_gemm_fp8_8wave(
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
 
         lds = fx.SharedAllocator().allocate(LDS).peek()
+
+        # Stage the complete ScaleB tile before constructing any tiled-MMA or
+        # accumulator fragments. The wait/barrier closes this register lifetime,
+        # allowing the loader's address VGPRs to be reused by the MFMA pipeline.
+        if const_expr(with_scale):
+            sB_rsrc = fx.buffer_ops.create_buffer_resource(
+                argScaleB,
+                num_records_bytes=arith._to_raw(
+                    fx.Int32(div_up(N, 128) * scaleA_stride * 4)
+                ),
+            )
+            scale_b_lds = fx.make_view(
+                lds.scale_b.ptr, fx.make_layout(scaleB_elems, 1)
+            )
+            scale_b_root_ptr = _fly_dialect.extract_aligned_pointer_as_index(
+                ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(scale_b_lds)
+            )
+            total_lanes = 512
+            rounds_32b = scaleB_elems // total_lanes
+            loaded_32b = rounds_32b * total_lanes
+            tail_elems = scaleB_elems - loaded_32b
+            scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
+            lane_byte_offset_32b = fx.Int32(tid * 4)
+            wave_offset_32b = rocdl.readfirstlane(
+                T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
+            )
+
+            for copy_round in range_constexpr(rounds_32b):
+                round_elem_offset = copy_round * total_lanes
+                scale_b_dst = fx.buffer_ops.get_element_ptr(
+                    scale_b_root_ptr,
+                    byte_offset=wave_offset_32b + round_elem_offset * 4,
+                    elem_type=T.i8,
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
+                    fx.Int32(scale_b_global_base + round_elem_offset * 4),
+                    fx.Int32(0), fx.Int32(0),
+                )
+
+            if const_expr(tail_elems > 0):
+                if tid < tail_elems:
+                    scale_b_dst = fx.buffer_ops.get_element_ptr(
+                        scale_b_root_ptr,
+                        byte_offset=wave_offset_32b + loaded_32b * 4,
+                        elem_type=T.i8,
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
+                        fx.Int32(scale_b_global_base + loaded_32b * 4),
+                        fx.Int32(0), fx.Int32(0),
+                    )
+
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
 
         # A/B LDS dual padding write/read layout（参考 gemm_4wave_950 fp8 gluon）
         # fp8采用的是双padding, 每8行padding 16个元素， 每16行额外再padding 32个元素
@@ -284,15 +349,14 @@ def compile_gemm_fp8_8wave(
         frag_P = thr_mma.make_fragment_C(bC_tl)  # 单级 FIFO partial
 
 
-        # ==== A block-scale 设置：A per-token group-128，B 不带 scale ====
-        # C[m,n] = sum_kb scaleA[m,kb] * (fp8 partial over k-block kb)。
+        # ==== A/B block-scale 设置：A per-token group-128，B per-128 rows/group-128 ====
+        # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * partial[kb]。
         # scaleA 以 f32 写入 ping-pong LDS，计算 phase 按当前 MFMA 行读回。
         # C fragment 布局 [val=N, n0(N_REP), m0(M_REP)]；M 行 = quadrant_m*128 + m0*32
         #   + wave_m*16 + lane%16（wave_m=wave_id//4）=> scaleA 随 m0/lane 变化，广播 val/n0。
         M_REP = TILE_M // 64
         N_REP = TILE_N // 128
         if const_expr(with_scale):
-            scaleA_stride = K // 128
             sA_rsrc = fx.buffer_ops.create_buffer_resource(
                 argScaleA, num_records_bytes=arith._to_raw(fx.Int32(M * scaleA_stride * 4))
             )
@@ -328,6 +392,22 @@ def compile_gemm_fp8_8wave(
                     fx.Int32(scale_src_wave_base + kb * 4), fx.Int32(0), fx.Int32(0),
                 )
 
+            def _scale_b_addr(kb):
+                return fx.Int32(fx.ptrtoint(lds.scale_b.ptr)) + kb * 4
+
+            def _rd_scale_b(addr, right):
+                result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
+                result = _llvm.inline_asm(
+                    result_type,
+                    [arith._to_raw(addr)],
+                    f"ds_read_b32 $1, $2 offset:{right * scaleA_stride * 4}\n"
+                    "s_waitcnt lgkmcnt(0)\n"
+                    "v_readfirstlane_b32 $0, $1",
+                    "=&s,=&v,v,~{memory}",
+                    has_side_effects=True,
+                )
+                return fx.Float32(_llvm.extractvalue(T.f32, result, [0]))
+
             def _rd_scale_a(buf, bottom):
                 half_offset = bottom * BLOCK_M
                 wave_copy_offset = wave_m * TILE_M
@@ -346,15 +426,53 @@ def compile_gemm_fp8_8wave(
                     scales.append(Vec(scale_frag.load())[0])
                 return Vec.from_elements(scales, fx.Float32)
 
-        def do_gemm(frag_C, frag_B, frag_A, prev_scale=None):
+        def do_gemm(frag_C, frag_B, frag_A, prev_scale_a=None, prev_scale_b=None):
             if const_expr(with_scale):
-                # 用上一 phase 的 scale slot 消费 FIFO，再生成当前 partial。
-                for m0 in range_constexpr(M_REP):
-                    for n0 in range_constexpr(N_REP):
+                # 单条 side-effect inline asm 固定 4x scalar FMA -> 1x MFMA，
+                # scaled path 不再依赖 LLVM sched_group_barrier 的重排结果。
+                result_type = ir.Type.parse(
+                    "!llvm.struct<(f32, f32, f32, f32, vector<4xf32>, f32)>"
+                )
+                for n0 in range_constexpr(N_REP):
+                    for m0 in range_constexpr(M_REP):
                         cs = frag_C[None, n0, m0]
-                        cs.store(cs.load() + frag_P[None, n0, m0].load() * Vec(prev_scale)[m0])
-                frag_P.fill(0)
-                fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
+                        scale_a = Vec(prev_scale_a)[m0]
+                        partial = Vec(frag_P[None, n0, m0].load())
+                        accum = Vec(cs.load())
+                        operand_a = vector.bitcast(
+                            T.vec(8, T.i32), frag_B[None, n0, 0].load()
+                        )
+                        operand_b = vector.bitcast(
+                            T.vec(8, T.i32), frag_A[None, m0, 0].load()
+                        )
+                        result = _llvm.inline_asm(
+                            result_type,
+                            [
+                                arith._to_raw(partial[0]), arith._to_raw(partial[1]),
+                                arith._to_raw(partial[2]), arith._to_raw(partial[3]),
+                                arith._to_raw(scale_a), arith._to_raw(prev_scale_b),
+                                arith._to_raw(accum[0]), arith._to_raw(accum[1]),
+                                arith._to_raw(accum[2]), arith._to_raw(accum[3]),
+                                arith._to_raw(operand_a), arith._to_raw(operand_b),
+                            ],
+                            "v_mul_f32 $5, $10, $11\n"
+                            "v_fma_f32 $0, $6, $5, $0\n"
+                            "v_fma_f32 $1, $7, $5, $1\n"
+                            "v_fma_f32 $2, $8, $5, $2\n"
+                            "v_fma_f32 $3, $9, $5, $3\n"
+                            "v_mfma_f32_16x16x128_f8f6f4 $4, $16, $17, 0",
+                            "=&v,=&v,=&v,=&v,=&v,=&v,v,v,v,v,v,s,0,1,2,3,v,v",
+                            has_side_effects=True,
+                        )
+                        cs.store(Vec.from_elements([
+                            fx.Float32(_llvm.extractvalue(T.f32, result, [0])),
+                            fx.Float32(_llvm.extractvalue(T.f32, result, [1])),
+                            fx.Float32(_llvm.extractvalue(T.f32, result, [2])),
+                            fx.Float32(_llvm.extractvalue(T.f32, result, [3])),
+                        ], fx.Float32))
+                        frag_P[None, n0, m0].store(
+                            _llvm.extractvalue(T.vec(4, T.f32), result, [4])
+                        )
             else:
                 # 单级 FIFO：先消费上一 phase 的 partial，再用当前 MFMA 覆盖 FIFO。
                 for m0 in range_constexpr(M_REP):
@@ -365,9 +483,10 @@ def compile_gemm_fp8_8wave(
                 fx.gemm(mma_atom, frag_P, frag_B, frag_A, frag_P)
 
         def schedule_fifo_valu_mfma(group_id):
-            for _ in range_constexpr(M_REP * N_REP):
-                rocdl.sched_group_barrier(0x002, 4, group_id)
-                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+            if const_expr(not with_scale):
+                for _ in range_constexpr(M_REP * N_REP):
+                    rocdl.sched_group_barrier(0x002, 4, group_id)
+                    rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         num_tiles = K // BLOCK_K
         assert num_tiles >= 4 and num_tiles % 2 == 0
         a_dsrd = frag_A_t.load().numel * element_type.width // 8 // 16
@@ -584,6 +703,7 @@ def compile_gemm_fp8_8wave(
             frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load(),
             frag_P.load(),
             Vec.from_elements([fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0)], fx.Float32),
+            fx.Float32(0),
         ]
 
         
@@ -594,11 +714,16 @@ def compile_gemm_fp8_8wave(
             frag_C_br.store(states[3])
             frag_P.store(states[4])
             if const_expr(with_scale):
-                fifo_scale_0 = Vec.from_elements(
+                fifo_scale_a_0 = Vec.from_elements(
                     [fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0)], fx.Float32
                 )
-                fifo_scale_1 = Vec(states[5])
+                fifo_scale_b_0 = fx.Float32(0)
+                fifo_scale_a_1 = Vec(states[5])
+                fifo_scale_b_1 = fx.Float32(states[6])
             kiter = fx.Int32(kidx)
+            if const_expr(with_scale):
+                scale_b_addr_0 = _scale_b_addr(kiter)
+                scale_b_addr_1 = _scale_b_addr(kiter + 1)
 
 
             if const_expr(True):
@@ -608,13 +733,14 @@ def compile_gemm_fp8_8wave(
                 _rd_At(tick)
                 if const_expr(with_scale):
                     mfma_scaleA = _rd_scale_a(tick, 0)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_0, 0)
                 _ac_Ab(tock, kiter+1)      
                 rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = mfma_scaleA
-                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_1)
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_a_1, fifo_scale_b_1)
                 else:
                     do_gemm(frag_C_br, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -622,11 +748,13 @@ def compile_gemm_fp8_8wave(
                 
                 _rd_Br(tick)
                 _ac_At(tick, kiter+2)
+                if const_expr(with_scale):
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_0, 1)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = mfma_scaleA
-                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_0)
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_a_0, fifo_scale_b_0)
                 else:
                     do_gemm(frag_C_tl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -635,12 +763,13 @@ def compile_gemm_fp8_8wave(
                 _rd_Ab(tick)
                 if const_expr(with_scale):
                     mfma_scaleA = _rd_scale_a(tick, 1)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_0, 0)
                 _ac_Bl(tick, kiter+2)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = mfma_scaleA
-                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_1)
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_a_1, fifo_scale_b_1)
                 else:
                     do_gemm(frag_C_tr, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -649,14 +778,15 @@ def compile_gemm_fp8_8wave(
                 _ac_Br(tick, kiter+2)
                 if const_expr(with_scale):
                     _ac_scale_a(tick, kiter + 2)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_0, 1)
                 rocdl.s_waitcnt(encode_waitcnt_950(
                     vmcnt=vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scale_a
                 ))
                 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = mfma_scaleA
-                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_0)
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_a_0, fifo_scale_b_0)
                 else:
                     do_gemm(frag_C_bl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -670,13 +800,14 @@ def compile_gemm_fp8_8wave(
                 _rd_At(tick)
                 if const_expr(with_scale):
                     mfma_scaleA = _rd_scale_a(tick, 0)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_1, 0)
                 _ac_Ab(tock, kiter+2)      
                 rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = mfma_scaleA
-                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_1)
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_br, frag_B_l, frag_A_t, fifo_scale_a_1, fifo_scale_b_1)
                 else:
                     do_gemm(frag_C_br, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -684,11 +815,13 @@ def compile_gemm_fp8_8wave(
                 
                 _rd_Br(tick)
                 _ac_At(tick, kiter+3)
+                if const_expr(with_scale):
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_1, 1)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = mfma_scaleA
-                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_0)
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_tl, frag_B_r, frag_A_t, fifo_scale_a_0, fifo_scale_b_0)
                 else:
                     do_gemm(frag_C_tl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -697,12 +830,13 @@ def compile_gemm_fp8_8wave(
                 _rd_Ab(tick)
                 if const_expr(with_scale):
                     mfma_scaleA = _rd_scale_a(tick, 1)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_1, 0)
                 _ac_Bl(tick, kiter+3)
 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_0 = mfma_scaleA
-                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_1)
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_tr, frag_B_l, frag_A_t, fifo_scale_a_1, fifo_scale_b_1)
                 else:
                     do_gemm(frag_C_tr, frag_B_l, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -711,14 +845,15 @@ def compile_gemm_fp8_8wave(
                 _ac_Br(tick, kiter+3)
                 if const_expr(with_scale):
                     _ac_scale_a(tick, kiter+3)
+                    mfma_scaleB = _rd_scale_b(scale_b_addr_1, 1)
                 rocdl.s_waitcnt(encode_waitcnt_950(
                     vmcnt=vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scale_a
                 ))
                 
                 begin_compute_phase()
                 if const_expr(with_scale):
-                    fifo_scale_1 = mfma_scaleA
-                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_0)
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB
+                    do_gemm(frag_C_bl, frag_B_r, frag_A_t, fifo_scale_a_0, fifo_scale_b_0)
                 else:
                     do_gemm(frag_C_bl, frag_B_r, frag_A_t)
                 schedule_fifo_valu_mfma(0)
@@ -729,14 +864,15 @@ def compile_gemm_fp8_8wave(
 
 
             if const_expr(not with_scale):
-                fifo_scale_1 = Vec.from_elements(
+                fifo_scale_a_1 = Vec.from_elements(
                     [fx.Float32(0), fx.Float32(0), fx.Float32(0), fx.Float32(0)], fx.Float32
                 )
+                fifo_scale_b_1 = fx.Float32(0)
     
             results = yield [
                 frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load(),
                 frag_P.load(),
-                fifo_scale_1,
+                fifo_scale_a_1, fifo_scale_b_1,
             ]
 
         frag_C_tl.store(results[0])
@@ -755,11 +891,18 @@ def compile_gemm_fp8_8wave(
         bC_br = fx.composition(bC_br, transposed_c_layout)
         
         if const_expr(with_scale):
-            fifo_scale_1 = Vec(results[5])
+            fifo_scale_a_1 = Vec(results[5])
+            fifo_scale_b_1 = fx.Float32(results[6])
             for m0 in range_constexpr(M_REP):
                 for n0 in range_constexpr(N_REP):
                     cs = frag_C_br[None, n0, m0]
-                    cs.store(cs.load() + frag_P[None, n0, m0].load() * Vec(fifo_scale_1)[m0])
+                    scale = Vec(fifo_scale_a_1)[m0] * fifo_scale_b_1
+                    scale_vec = Vec.from_elements(
+                        [scale, scale, scale, scale], fx.Float32
+                    )
+                    cs.store(fx.fma(
+                        frag_P[None, n0, m0].load(), scale_vec, cs.load()
+                    ))
         else:
             # tail：最后一个 phase(BR) 的 partial 尚留在 FIFO。
             for m0 in range_constexpr(M_REP):
@@ -881,13 +1024,18 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
         if not with_scale:
             return empty, empty
         sA = torch.rand((M, KB), device="cuda", dtype=torch.float32)
-        return sA, empty
+        sB = torch.rand((N // 128, KB), device="cuda", dtype=torch.float32)
+        return sA, sB
 
     def _ref(a, b, sA, sB):
         if not with_scale:
             return a.float() @ b.float().t()
         a_deq = (a.float().view(M, KB, 128) * sA.view(M, KB, 1)).view(M, K)
-        return a_deq @ b.float().t()
+        b_deq = (
+            b.float().view(N // 128, 128, KB, 128)
+            * sB.view(N // 128, 1, KB, 1)
+        ).view(N, K)
+        return a_deq @ b_deq.t()
 
     a = (torch.rand(M, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
     b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
