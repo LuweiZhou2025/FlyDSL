@@ -372,7 +372,7 @@ def compile_gemm_fp8_8wave(
 
         # ==== A/B block-scale 设置：A per-token group-128，B per-128 rows/group-128 ====
         # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * partial[kb]。
-        # scaleA 以 f32 写入 ping-pong LDS，计算 phase 按当前 MFMA 行读回。
+        # scaleA [KB, M] 以 f32 写入 ping-pong LDS，计算 phase 按当前 MFMA 行读回。
         # C fragment 布局 [val=N, n0(N_REP), m0(M_REP)]；M 行 = quadrant_m*128 + m0*32
         #   + wave_m*16 + lane%16（wave_m=wave_id//4）=> scaleA 随 m0/lane 变化，广播 val/n0。
         M_REP = TILE_M // 64
@@ -402,15 +402,15 @@ def compile_gemm_fp8_8wave(
                 )
 
             scale_row = tid % TILE_M
-            scale_lane_src_offset = fx.Int32(scale_row * scaleA_stride * 4)
-            scale_src_wave_base = fx.Int32(bid_x * TILE_M * scaleA_stride * 4)
+            scale_lane_src_offset = fx.Int32(scale_row * 4)
+            scale_src_tile_base = fx.Int32(bid_x * TILE_M * 4)
 
             def _ac_scale_a(buf, kb):
                 scale_dst = _scale_dst_ptr(scale_a_lds[buf], scale_wave_dst_offset)
                 rocdl.raw_ptr_buffer_load_lds(
                     sA_rsrc, scale_dst, fx.Int32(4),
                     scale_lane_src_offset,
-                    fx.Int32(scale_src_wave_base + kb * 4), fx.Int32(0), fx.Int32(0),
+                    fx.Int32(scale_src_tile_base + kb * M * 4), fx.Int32(0), fx.Int32(0),
                 )
 
             def _scale_b_addr(kb):
@@ -1068,11 +1068,12 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
     sA, sB = _gen_scales()
     ref = _ref(a, b, sA, sB)
+    sA_kernel = sA.transpose(0, 1).contiguous() if with_scale else sA
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     weight = _shuffle_b(b)
     stream = torch.cuda.current_stream()
     args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1),
-            sA.view(-1), sB.view(-1), M, stream)
+            sA_kernel.view(-1), sB.view(-1), M, stream)
 
     launcher = compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, N, K, permlane_epilogue=permlane_output,
                                       preshuffle_b=preshuffle_b, with_scale=with_scale, useTileDMA=useTiledDMA)
@@ -1132,11 +1133,12 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
     Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
     SAs = [(_gen_scales()[0] if with_scale else empty) for _ in range(data_clones)]
+    SAs_kernel = [sa.transpose(0, 1).contiguous() if with_scale else sa for sa in SAs]
     SBs = [(_gen_scales()[1] if with_scale else empty) for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
     arg_sets = [
         (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), Cs[i].view(-1),
-         SAs[i].view(-1), SBs[i].view(-1), M, stream)
+         SAs_kernel[i].view(-1), SBs[i].view(-1), M, stream)
         for i in range(data_clones)
     ]
     flops = 2 * M * N * K
@@ -1164,5 +1166,5 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     
     K = 6144
-    run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
+    run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
     run_test(M=16384, N=3584, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
