@@ -209,19 +209,19 @@ def compile_gemm_fp8(
             # dword/lane (value=1); an i8 value=4 copy misplaces the source by +3 bytes.
             scale_a_iter = fx.recast_iter(Int32, fx.get_iter(argScaleA))
             scale_b_iter = fx.recast_iter(Int32, fx.get_iter(argScaleB))
-            scale_a_layout = fx.make_layout(
+            scale_a_layout_int32 = fx.make_layout(
                 ((32, 8), (M // 128, K // 128)),
                 ((1, M // 4), (32, M)),
             )
-            scale_b_layout = fx.make_layout(
+            scale_b_layout_int32 = fx.make_layout(
                 ((32, 8), (N // 128, K // 128)),
                 ((1, N // 4), (32, N)),
             )
             ScaleA = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(scale_a_iter, scale_a_layout)), max_size=False
+                fx.Tensor(fx.make_view(scale_a_iter, scale_a_layout_int32)), max_size=False
             )
             ScaleB = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(scale_b_iter, scale_b_layout)), max_size=False
+                fx.Tensor(fx.make_view(scale_b_iter, scale_b_layout_int32)), max_size=False
             )
         c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=False)
 
@@ -310,7 +310,7 @@ def compile_gemm_fp8(
         if const_expr(with_scale):
             scale_async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
             # One i32 word (4 packed E8M0) per lane; 32 i32-rows x 8 groups = 256 lanes.
-            scale_g2s_tv = fx.make_layout(((32, 8), 1), ((1, 32), 0))
+            scale_g2s_tv = fx.make_layout(((256, 1), 1), ((1, 0), 0))
             scale_dma = fx.make_tiled_copy(
                 scale_async_copy_atom, scale_g2s_tv, fx.make_tile(32, 8)
             ).get_slice(tid)
@@ -1012,7 +1012,7 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
