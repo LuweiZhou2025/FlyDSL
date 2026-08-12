@@ -20,11 +20,10 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int16, Int32, T, Vector
+from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int32, T, Vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
@@ -94,16 +93,12 @@ def compile_gemm_fp8(
     pid_swizzle=True,
     lds_swizzle=False,
     preshuffle_b=False,
-    mxfp8=False,
     permlane_epilogue=True,
     store_overlap=False,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
-    assert not mxfp8 or preshuffle_b, "MXFP8 requires preshuffle_b=True"
-    assert not mxfp8 or BLOCK_K == 128, "MXFP8 scale packing assumes BLOCK_K=128"
-    assert not mxfp8 or K % 256 == 0, "MXFP8 scale packing requires K divisible by 256"
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
@@ -155,19 +150,9 @@ def compile_gemm_fp8(
         b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
         b_r0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
         b_r1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
-        # One BK=128 scale tile: four 128x4 quadrants, packed as i16 per lane.
-        scale0: fx.Array[Int16, 1024, 16]
-        scale1: fx.Array[Int16, 1024, 16]
 
     @flyc.kernel(known_block_size=[256, 1, 1])
-    def gemm_kernel(
-        argA: fx.Tensor,
-        argB: fx.Tensor,
-        argC: fx.Tensor,
-        argScaleA: fx.Tensor,
-        argScaleB: fx.Tensor,
-        M: int,
-    ):
+    def gemm_kernel(argA: fx.Tensor, argB: fx.Tensor, argC: fx.Tensor, M: int):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
         if const_expr(pid_swizzle):
@@ -186,9 +171,6 @@ def compile_gemm_fp8(
         B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
         c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
-        if const_expr(mxfp8):
-            scale_a_rsrc = fx.buffer_ops.create_buffer_resource(argScaleA, max_size=True)
-            scale_b_rsrc = fx.buffer_ops.create_buffer_resource(argScaleB, max_size=True)
 
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
@@ -234,33 +216,11 @@ def compile_gemm_fp8(
         bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 1, bid_y * 2 + 0]
         bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 1, bid_y * 2 + 1]
 
-        # ---- tiled MMA: MFMA_Scale 16x16x128 f8f6f4 ----
+        # ---- tiled MMA: MFMA_Scale 16x16x128 f8f6f4, scale=0 (no scale) ----
         mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, element_type))
         mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
         mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
-        if const_expr(mxfp8):
-            # MFMA operand A is logical B in this transposed kernel, so opsel_a
-            # selects the N scale while opsel_b selects the M scale.
-            scale_atoms = {
-                (opsel_a, opsel_b): fx.make_mma_atom(
-                    fx.rocdl.cdna4.MFMA_Scale(
-                        16,
-                        16,
-                        128,
-                        element_type,
-                        opsel_a=opsel_a,
-                        opsel_b=opsel_b,
-                    )
-                )
-                for opsel_a in range_constexpr(4)
-                for opsel_b in range_constexpr(4)
-            }
-        if const_expr(mxfp8):
-            # MXFP8 assigns each 16-lane group two K16 segments 64 elements apart,
-            # so one lane's K32 values share one E8M0 scale byte.
-            k_perm = fx.make_layout(((16, 2), 4), ((1, 64), 16))
-        else:
-            k_perm = fx.make_layout((32, 4), (1, 32))
+        k_perm = fx.make_layout((32, 4), (1, 32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)), (None, None, k_perm))
         print(f'############tiled_mma: {tiled_mma}')
         thr_mma = tiled_mma.thr_slice(tid)
@@ -369,144 +329,19 @@ def compile_gemm_fp8(
         frag_C_bl = fx.select(thr_mma.make_fragment_C(bC_bl), [0, 2, 1])
         frag_C_br = fx.select(thr_mma.make_fragment_C(bC_br), [0, 2, 1])
 
-        if const_expr(mxfp8):
-            lane_id = tid % 64
-            wave_id = tid // 64
-            wave_m = wave_id // 2
-            wave_n = wave_id % 2
-            scale_chunk_dwords = (K // 256) * 64
-            scale_tile_lds = [
-                fx.make_view(lds.scale0.ptr, fx.make_layout(1024, 1)),
-                fx.make_view(lds.scale1.ptr, fx.make_layout(1024, 1)),
-            ]
-            def scale_prefetch_indices(k_tile):
-                chunk = k_tile // 2
-                k_half = k_tile % 2
-                row_block = tid // 64
-                lane = tid % 64
-                tile_offset = chunk * 64 + lane
-                pair_offset = k_half
-                local_index = row_block * 64 + lane
-                return tile_offset, pair_offset, row_block, local_index
-
-            def store_mx_scale(buf, quadrant, local_index, packed):
-                if const_expr(buf == 0):
-                    lds.scale0.ptr[quadrant * 256 + local_index] = fx.Int16(packed)
-                else:
-                    lds.scale1.ptr[quadrant * 256 + local_index] = fx.Int16(packed)
-
-            def prefetch_mx_scale_at(k_tile, buf):
-                tile_offset, pair_offset, row_block, local_index = scale_prefetch_indices(k_tile)
-                dword = (bid_x * 8 + row_block) * scale_chunk_dwords + tile_offset
-                packed = fx.buffer_ops.buffer_load(
-                    scale_a_rsrc, dword * 2 + pair_offset, vec_width=1, dtype=T.i16
-                )
-                store_mx_scale(buf, 0, local_index, packed)
-
-            def prefetch_mx_scale_ab(k_tile, buf):
-                tile_offset, pair_offset, row_block, local_index = scale_prefetch_indices(k_tile)
-                dword = (bid_x * 8 + 4 + row_block) * scale_chunk_dwords + tile_offset
-                packed = fx.buffer_ops.buffer_load(
-                    scale_a_rsrc, dword * 2 + pair_offset, vec_width=1, dtype=T.i16
-                )
-                store_mx_scale(buf, 1, local_index, packed)
-
-            def prefetch_mx_scale_bl(k_tile, buf):
-                tile_offset, pair_offset, row_block, local_index = scale_prefetch_indices(k_tile)
-                dword = (bid_y * 8 + row_block) * scale_chunk_dwords + tile_offset
-                packed = fx.buffer_ops.buffer_load(
-                    scale_b_rsrc, dword * 2 + pair_offset, vec_width=1, dtype=T.i16
-                )
-                store_mx_scale(buf, 2, local_index, packed)
-
-            def prefetch_mx_scale_br(k_tile, buf):
-                tile_offset, pair_offset, row_block, local_index = scale_prefetch_indices(k_tile)
-                dword = (bid_y * 8 + 4 + row_block) * scale_chunk_dwords + tile_offset
-                packed = fx.buffer_ops.buffer_load(
-                    scale_b_rsrc, dword * 2 + pair_offset, vec_width=1, dtype=T.i16
-                )
-                store_mx_scale(buf, 3, local_index, packed)
-
-            def load_scale_rows(buf, quadrant):
-                scales = []
-                quadrant_base = quadrant * 256
-                for row_block in range_constexpr(4):
-                    index = quadrant_base + row_block * 64 + lane_id
-                    pair = fx.Int32(scale_tile_lds[buf][index]) & fx.Int32(0xFFFF)
-                    scales.append(pair | (pair << fx.Int32(16)))
-                return scales
-
-            def load_mx_scale_at(buf):
-                return load_scale_rows(buf, 0)
-
-            def load_mx_scale_ab(buf):
-                return load_scale_rows(buf, 1)
-
-            def load_mx_scale_bl(buf):
-                return load_scale_rows(buf, 2)
-
-            def load_mx_scale_br(buf):
-                return load_scale_rows(buf, 3)
-
-            def scaled_gemm(c_frag, b_frag, a_frag, scales_a, scales_b, k_half):
-                c_value = c_frag.load().ir_value()
-                b_value = vector.bitcast(T.vec(128, T.i8), b_frag.load().ir_value())
-                a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
-                scale_shift_a = wave_m * fx.Int32(8)
-                scale_shift_b = wave_n * fx.Int32(8)
-                for n0 in range_constexpr(4):
-                    for m0 in range_constexpr(4):
-                        c_offset = (m0 * 4 + n0) * 4
-                        c_sub = vector.extract_strided_slice(
-                            T.vec(4, T.f32), c_value, offsets=[c_offset], sizes=[4], strides=[1]
-                        )
-                        b_sub = vector.extract_strided_slice(
-                            T.vec(32, T.i8), b_value, offsets=[n0 * 32], sizes=[32], strides=[1]
-                        )
-                        a_sub = vector.extract_strided_slice(
-                            T.vec(32, T.i8), a_value, offsets=[m0 * 32], sizes=[32], strides=[1]
-                        )
-                        scale_a = fx.Int32(arith.shrui(arith._to_raw(scales_b[n0]), arith._to_raw(scale_shift_b)))
-                        scale_b = fx.Int32(arith.shrui(arith._to_raw(scales_a[m0]), arith._to_raw(scale_shift_a)))
-                        scaled_atom = fx.atom_set_value(
-                            scale_atoms[(k_half * 2, k_half * 2)],
-                            "scale_a",
-                            scale_a,
-                        )
-                        scaled_atom = fx.atom_set_value(
-                            scaled_atom, "scale_b", scale_b
-                        )
-                        c_sub = _fly.mma_atom_call_ssa([T.vec(4, T.f32)], scaled_atom, b_sub, a_sub, c_sub)
-                        c_value = vector.insert_strided_slice(c_sub, c_value, [c_offset], [1])
-                c_frag.store(c_value)
-
-            def do_gemm(c_frag, b_frag, a_frag, scales_a=None, scales_b=None, k_half=0):
-                scaled_gemm(c_frag, b_frag, a_frag, scales_a, scales_b, k_half)
-        else:
-            def do_gemm(c_frag, b_frag, a_frag, scales_a=None, scales_b=None, k_half=0):
-                fx.gemm(mma_atom, c_frag, b_frag, a_frag, c_frag)
-
         num_tiles = K // BLOCK_K
-        assert num_tiles >= 2
+        assert num_tiles >= 4
 
         # ---- prologue：预取 tile0/tile1 到 LDS buf0/buf1，再把 buf0 的 B_l/A_t s2r 到寄存器 ----
         # 对标 gemm_v9：8 条 async g2s（2 tile × 4 array），waitvmcnt_barrier(24)，再 s2r B_l/A_t。
         def do_g2s(kk, buf):
             ki = fx.Int32(kk)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_bl(ki, buf)
             fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
             rocdl.sched_barrier(0)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_at(ki, buf)
             fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
             rocdl.sched_barrier(0)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_ab(ki, buf)
             fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
             rocdl.sched_barrier(0)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_br(ki, buf)
             fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
             rocdl.sched_barrier(0)
 
@@ -517,12 +352,6 @@ def compile_gemm_fp8(
         fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
         rocdl.sched_barrier(0)
-        if const_expr(mxfp8):
-            scale0_B_l = load_mx_scale_bl(0)
-            scale0_A_t = load_mx_scale_at(0)
-        else:
-            scale0_A_t = scale0_A_b = scale0_B_l = scale0_B_r = None
-            scale1_A_t = scale1_A_b = scale1_B_l = scale1_B_r = None
 
         frag_C_tl.fill(0)
         frag_C_tr.fill(0)
@@ -555,95 +384,65 @@ def compile_gemm_fp8(
             frag_C_bl.store(states[2])
             frag_C_br.store(states[3])
             kiter = fx.Int32(kidx)
-            if const_expr(mxfp8):
-                scale0_B_l = load_mx_scale_bl(0)
-                scale0_A_t = load_mx_scale_at(0)
 
             # ---- k-tile = buf0：4 象限 ----
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale0_A_t, scale0_B_l, 0)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale0_A_b = load_mx_scale_ab(0)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_bl(kiter + 2, 0)
             fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            hot_loop_scheduler_mainloop(0, b_vmem + (1 if mxfp8 else 0), a_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(0, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale0_A_b, scale0_B_l, 0)
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale0_B_r = load_mx_scale_br(0)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_at(kiter + 2, 0)
             fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            hot_loop_scheduler_mainloop(1, a_vmem + (1 if mxfp8 else 0), b_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(1, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale0_A_t, scale0_B_r, 0)
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale1_B_l = load_mx_scale_bl(1)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_ab(kiter + 2, 0)
             fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            hot_loop_scheduler_mainloop(2, a_vmem + (1 if mxfp8 else 0), b_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(2, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale0_A_b, scale0_B_r, 0)
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale1_A_t = load_mx_scale_at(1)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_br(kiter + 2, 0)
             fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
-            hot_loop_scheduler_mainloop(3, b_vmem + (1 if mxfp8 else 0), a_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(3, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
             # ---- k-tile = buf1：4 象限 ----
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale1_A_t, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale1_A_b = load_mx_scale_ab(1)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_bl(kiter + 3, 1)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            hot_loop_scheduler_mainloop(4, b_vmem + (1 if mxfp8 else 0), a_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(4, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale1_A_b, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                scale1_B_r = load_mx_scale_br(1)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_at(kiter + 3, 1)
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            hot_loop_scheduler_mainloop(5, a_vmem + (1 if mxfp8 else 0), b_dsrd + (4 if mxfp8 else 0))
+            hot_loop_scheduler_mainloop(5, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale1_A_t, scale1_B_r, 1)
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
             waitvmcnt_barrier(20)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_ab(kiter + 3, 1)
             fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            hot_loop_scheduler_mainloop(6, a_vmem + (1 if mxfp8 else 0), b_dsrd)
+            hot_loop_scheduler_mainloop(6, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale1_A_b, scale1_B_r, 1)
-            waitvmcnt_barrier(0 if mxfp8 else 20)
-            if const_expr(mxfp8):
-                prefetch_mx_scale_br(kiter + 3, 1)
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
+            waitvmcnt_barrier(20)
             fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
-            hot_loop_scheduler_mainloop(7, b_vmem + (1 if mxfp8 else 0), a_dsrd)
+            hot_loop_scheduler_mainloop(7, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
+
             results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
         frag_C_tl.store(results[0])
         frag_C_tr.store(results[1])
@@ -653,32 +452,25 @@ def compile_gemm_fp8(
         # ---- epilogue：最后 2 个 k-tile（buf0 / buf1），无 g2s，只做 s2r + gemm ----
         # buf0 的 4 象限
         waitvmcnt_barrier(20)
-        if const_expr(mxfp8):
-            scale0_B_l = load_mx_scale_bl(0)
-            scale0_A_t = load_mx_scale_at(0)
-        do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale0_A_t, scale0_B_l, 0)
+        fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
         fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
         hot_loop_scheduler_mainloop(0, 0, 8)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(16)
-        if const_expr(mxfp8):
-            scale0_A_b = load_mx_scale_ab(0)
-        do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale0_A_b, scale0_B_l, 0)
+        fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
         fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
         hot_loop_scheduler_mainloop(1, 0, 8)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(12)
-        if const_expr(mxfp8):
-            scale0_B_r = load_mx_scale_br(0)
-        do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale0_A_t, scale0_B_r, 0)
+        fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
         fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
         hot_loop_scheduler_mainloop(2, 0, 8)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(8)
-        do_gemm(frag_C_br, frag_B_r, frag_A_b, scale0_A_b, scale0_B_r, 0)
+        fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
         fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
         hot_loop_scheduler_mainloop(3, 0, 8)
         rocdl.sched_barrier(0)
@@ -750,34 +542,27 @@ def compile_gemm_fp8(
         # 否则先算完 4 象限，再统一 store（不交织，用于对照）。
         if const_expr(store_overlap):
             waitvmcnt_barrier(4)
-            if const_expr(mxfp8):
-                scale1_B_l = load_mx_scale_bl(1)
-                scale1_A_t = load_mx_scale_at(1)
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale1_A_t, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             hot_loop_scheduler_mainloop(4, 0, 8)
             rocdl.sched_barrier(0)
 
             waitvmcnt_barrier(0)
-            if const_expr(mxfp8):
-                scale1_A_b = load_mx_scale_ab(1)
             # bl 的 MFMA 与 tl 的 store 互相掩盖
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale1_A_b, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             store_quadrant(frag_C_tl, bC_tl, 0, 0)
             scheduler_store_overlap(5)
             rocdl.sched_barrier(0)
 
             # tr 的 MFMA 掩盖 bl 的 store
-            if const_expr(mxfp8):
-                scale1_B_r = load_mx_scale_br(1)
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale1_A_t, scale1_B_r, 1)
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
             store_quadrant(frag_C_bl, bC_bl, 1, 0)
             scheduler_store_overlap(6)
             rocdl.sched_barrier(0)
 
             # br 的 MFMA 掩盖 tr 的 store
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale1_A_b, scale1_B_r, 1)
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
             store_quadrant(frag_C_tr, bC_tr, 0, 1)
             scheduler_store_overlap(7)
             rocdl.sched_barrier(0)
@@ -786,28 +571,21 @@ def compile_gemm_fp8(
             store_quadrant(frag_C_br, bC_br, 1, 1)
         else:
             waitvmcnt_barrier(4)
-            if const_expr(mxfp8):
-                scale1_B_l = load_mx_scale_bl(1)
-                scale1_A_t = load_mx_scale_at(1)
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale1_A_t, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             hot_loop_scheduler_mainloop(4, 0, 8)
             rocdl.sched_barrier(0)
 
             waitvmcnt_barrier(0)
-            if const_expr(mxfp8):
-                scale1_A_b = load_mx_scale_ab(1)
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale1_A_b, scale1_B_l, 1)
+            fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             hot_loop_scheduler_mainloop(5, 0, 8)
             rocdl.sched_barrier(0)
 
-            if const_expr(mxfp8):
-                scale1_B_r = load_mx_scale_br(1)
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale1_A_t, scale1_B_r, 1)
+            fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
             hot_loop_scheduler_mainloop(6, 0, 0)
             rocdl.sched_barrier(0)
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale1_A_b, scale1_B_r, 1)
+            fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
             hot_loop_scheduler_mainloop(7, 0, 0)
             rocdl.sched_barrier(0)
 
@@ -817,22 +595,14 @@ def compile_gemm_fp8(
             store_quadrant(frag_C_br, bC_br, 1, 1)
 
     @flyc.jit
-    def launch_gemm(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        ScaleA: fx.Tensor,
-        ScaleB: fx.Tensor,
-        M: int,
-        stream: fx.Stream = fx.Stream(None),
-    ):
+    def launch_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
         # 累加器钉到 AGPR（force-agpr）+ mfma-vgpr-form=False：避免 C 累加器 VGPR/AGPR 混放导致的
         # v_accvgpr 拷贝与 VGPR 压力（对标 test_gemm_v9.py）。
         value_attrs = {
             "rocdl.waves_per_eu": 1,
             "passthrough": [["amdgpu-agpr-alloc", "256,256"]],
         }
-        gemm_kernel(A, B, C, ScaleA, ScaleB, M, value_attrs=value_attrs).launch(
+        gemm_kernel(A, B, C, M, value_attrs=value_attrs).launch(
             grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -868,114 +638,24 @@ def _load_shuffle_weight():
 
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
-             run_count=50, data_clones=32, MXFP8=False, MXFP8_SCALE_PROBE=None,
-             ):
+             run_count=50, data_clones=32):
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
 
     def _shuffle_b(x):
         return shuffle_weight(x, layout=(16, 64)) if PRESHUFFLE_B else x
 
-    if MXFP8:
-        assert PRESHUFFLE_B, "MXFP8 requires PRESHUFFLE_B=True"
-        import aiter
-        from aiter import dtypes
-        from aiter.utility import fp4_utils
-
-        quant_index = 0
-
-        def _quant_mxfp8(x):
-            nonlocal quant_index
-            x_q, scale = aiter.per_1x32_mx_quant_hip(
-                x,
-                quant_dtype=dtypes.fp8,
-                scale_type=dtypes.fp8_e8m0,
-                shuffle=False,
-            )
-            is_a = quant_index == 0
-            quant_index += 1
-            map_probe = MXFP8_SCALE_PROBE is not None and MXFP8_SCALE_PROBE.startswith(("a_map", "b_map"))
-            if map_probe:
-                probe_operand, probe_groups = MXFP8_SCALE_PROBE.split("_map")
-                data_group, scale_group = (int(group) for group in probe_groups.split("_"))
-                x_q.zero_()
-                x_q[:, data_group * 32:(data_group + 1) * 32] = 1
-                scale.view(torch.uint8).fill_(127)
-                varying_operand = (probe_operand == "a" and is_a) or (
-                    probe_operand == "b" and not is_a
-                )
-                if varying_operand:
-                    scale.view(torch.uint8)[:, scale_group] = 126
-            if MXFP8_SCALE_PROBE == "unit":
-                scale.view(torch.uint8).fill_(127)
-            elif MXFP8_SCALE_PROBE == "row":
-                row_scale = 119 + torch.arange(x.shape[0], device=x.device, dtype=torch.uint8) % 3
-                scale.view(torch.uint8).copy_(row_scale[:, None])
-            elif MXFP8_SCALE_PROBE == "k":
-                k_scale = 119 + torch.arange(K // 32, device=x.device, dtype=torch.uint8) % 3
-                scale.view(torch.uint8).copy_(k_scale[None, :])
-            elif MXFP8_SCALE_PROBE in ("a_k", "b_k"):
-                varying_operand = (MXFP8_SCALE_PROBE == "a_k" and is_a) or (
-                    MXFP8_SCALE_PROBE == "b_k" and not is_a
-                )
-                if varying_operand:
-                    k_scale = 119 + torch.arange(K // 32, device=x.device, dtype=torch.uint8) % 3
-                    scale.view(torch.uint8).copy_(k_scale[None, :])
-                else:
-                    scale.view(torch.uint8).fill_(127)
-            elif MXFP8_SCALE_PROBE in ("a_row", "b_row"):
-                varying_operand = (MXFP8_SCALE_PROBE == "a_row" and is_a) or (
-                    MXFP8_SCALE_PROBE == "b_row" and not is_a
-                )
-                if varying_operand:
-                    row_scale = 119 + torch.arange(x.shape[0], device=x.device, dtype=torch.uint8) % 3
-                    scale.view(torch.uint8).copy_(row_scale[:, None])
-                else:
-                    scale.view(torch.uint8).fill_(127)
-            elif MXFP8_SCALE_PROBE is not None and MXFP8_SCALE_PROBE.startswith(("a_k", "b_k")) and MXFP8_SCALE_PROBE[-1].isdigit():
-                probe_operand, probe_group = MXFP8_SCALE_PROBE.split("_k")
-                varying_operand = (probe_operand == "a" and is_a) or (
-                    probe_operand == "b" and not is_a
-                )
-                scale.view(torch.uint8).fill_(127)
-                if varying_operand:
-                    scale.view(torch.uint8)[:, int(probe_group)] = 126
-            elif map_probe:
-                pass
-            elif MXFP8_SCALE_PROBE is not None:
-                raise ValueError(f"unknown MXFP8_SCALE_PROBE={MXFP8_SCALE_PROBE!r}")
-            scale_unshuffled = scale
-            scale_f32 = fp4_utils.e8m0_to_f32(scale_unshuffled).float()
-            x_dequant = (x_q.float().view(x.shape[0], K // 32, 32) * scale_f32[..., None]).reshape(x.shape)
-            scale_shuffled = fp4_utils.e8m0_shuffle(scale_unshuffled)
-            return x_q, scale_shuffled, x_dequant
-
-        a, scale_a, a_ref = _quant_mxfp8(torch.randn((M, K), device="cuda", dtype=torch.bfloat16))
-        b, scale_b, b_ref = _quant_mxfp8(torch.randn((N, K), device="cuda", dtype=torch.bfloat16))
-        ref = a_ref @ b_ref.t()
-    else:
-        a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
-        b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
-        ref = a.float() @ b.float().t()
-        scale_a = torch.empty(0, device="cuda", dtype=torch.uint8)
-        scale_b = torch.empty(0, device="cuda", dtype=torch.uint8)
+    a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+    b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+    ref = a.float() @ b.float().t()
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     weight = _shuffle_b(b)  # preshuffle 时喂 shuffle 后的 B；ref 仍用原始 b
     stream = torch.cuda.current_stream()
-    args = (
-        a.view(torch.int8).view(-1),
-        weight.view(torch.int8).view(-1),
-        out.view(-1),
-        scale_a.view(torch.uint8).view(-1),
-        scale_b.view(torch.uint8).view(-1),
-        M,
-        stream,
-    )
+    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1), M, stream)
 
     launcher = compile_gemm_fp8(
         TILEM, TILEN, TILEK, N, K,
         lds_swizzle=USE_SWIZZLE,
         preshuffle_b=PRESHUFFLE_B,
-        mxfp8=MXFP8,
         permlane_epilogue=permlane_output,
         store_overlap=store_overlap,
     )
@@ -984,13 +664,8 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     torch.cuda.synchronize()
 
     is_correct = torch.allclose(out.float(), ref, rtol=0.02, atol=0.01)
-    diff = pyhip.calc_diff(out.float(), ref.to(torch.bfloat16))
-    print(
-        f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} "
-        f"{MXFP8=} {MXFP8_SCALE_PROBE=} {is_correct=} {diff=}"
-    )
-    if MXFP8_SCALE_PROBE is not None and "_map" in MXFP8_SCALE_PROBE:
-        print(f"  map_value out={out[0, 0].item()} ref={ref[0, 0].item()}")
+    diff = pyhip.calc_diff(out.float(), ref.to(torch.bfloat16), diff_thr=0.00001)
+    print(f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {is_correct=} {diff=}")
     if not is_correct:
         mism = (out.float() - ref).abs()
         print(f"  max_abs_err={mism.max().item():.3f}  mism_count={(mism>0.5).sum().item()}/{M*N}")
@@ -1000,27 +675,11 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
 
     # ---- perf（多份数据轮转，排除 L2 cache 影响）----
     # 单份 A+B 只有几十 MB，反复喂同一份会常驻 L2 -> 高估 TFLOPS；轮转多份（远大于 L2）确保 cold data。
-    if MXFP8:
-        As = [a.clone() for _ in range(data_clones)]
-        Bs = [weight.clone() for _ in range(data_clones)]
-        ScaleAs = [scale_a.clone() for _ in range(data_clones)]
-        ScaleBs = [scale_b.clone() for _ in range(data_clones)]
-    else:
-        As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
-        Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
-        ScaleAs = [scale_a] * data_clones
-        ScaleBs = [scale_b] * data_clones
+    As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
+    Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
     arg_sets = [
-        (
-            As[i].view(torch.int8).view(-1),
-            Bs[i].view(torch.int8).view(-1),
-            Cs[i].view(-1),
-            ScaleAs[i].view(torch.uint8).view(-1),
-            ScaleBs[i].view(torch.uint8).view(-1),
-            M,
-            stream,
-        )
+        (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), Cs[i].view(-1), M, stream)
         for i in range(data_clones)
     ]
 
