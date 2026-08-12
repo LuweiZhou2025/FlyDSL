@@ -20,7 +20,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int32, T, Vector
+from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int8, Int32, T, Vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
@@ -95,10 +95,13 @@ def compile_gemm_fp8(
     preshuffle_b=False,
     permlane_epilogue=True,
     store_overlap=False,
+    with_scale=False,
 ):
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
+    assert BLOCK_K == 128
+    assert K % 256 == 0
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
@@ -139,20 +142,48 @@ def compile_gemm_fp8(
     A_GROUP = 8 * BLOCK_K + A_PAD  # 1056
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
     b_lds_elems = (BLOCK_N // 8) * A_GROUP  # 16896
+    scale_lds_bytes = 128 * 8
 
-    @fx.struct
-    class LDS:
-        a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_t1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_b0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_b1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        b_l0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
-        b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
-        b_r0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
-        b_r1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+    if with_scale:
+        @fx.struct
+        class LDS:
+            a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_t1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_b0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_b1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            b_l0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_r0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_r1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            scale_a_t0: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_a_t1: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_a_b0: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_a_b1: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_b_l0: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_b_l1: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_b_r0: fx.Array[Int8, scale_lds_bytes, 16]
+            scale_b_r1: fx.Array[Int8, scale_lds_bytes, 16]
+    else:
+        @fx.struct
+        class LDS:
+            a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_t1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_b0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            a_b1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+            b_l0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_r0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+            b_r1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
 
     @flyc.kernel(known_block_size=[256, 1, 1])
-    def gemm_kernel(argA: fx.Tensor, argB: fx.Tensor, argC: fx.Tensor, M: int):
+    def gemm_kernel(
+        argA: fx.Tensor,
+        argB: fx.Tensor,
+        argScaleA: fx.Tensor,
+        argScaleB: fx.Tensor,
+        argC: fx.Tensor,
+        M: int,
+    ):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
         if const_expr(pid_swizzle):
@@ -170,7 +201,27 @@ def compile_gemm_fp8(
         A = fx.rocdl.make_buffer_tensor(A_2d, max_size=False)
         B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
-        c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=True)
+
+        if const_expr(with_scale):
+            # Host: [rows, G] -> [rows/128, 4, 32, G] -> permute(3, 0, 2, 1).
+            # Each K tile views an overlapping [128, 8] window; only its first half is consumed.
+            scale_a_iter = fx.recast_iter(Int8, fx.get_iter(argScaleA))
+            scale_b_iter = fx.recast_iter(Int8, fx.get_iter(argScaleB))
+            scale_a_layout = fx.make_layout(
+                ((128, 8), (M // 128, K // 128)),
+                ((1, M), (128, 4 * M)),
+            )
+            scale_b_layout = fx.make_layout(
+                ((128, 8), (N // 128, K // 128)),
+                ((1, N), (128, 4 * N)),
+            )
+            ScaleA = fx.rocdl.make_buffer_tensor(
+                fx.Tensor(fx.make_view(scale_a_iter, scale_a_layout)), max_size=False
+            )
+            ScaleB = fx.rocdl.make_buffer_tensor(
+                fx.Tensor(fx.make_view(scale_b_iter, scale_b_layout)), max_size=False
+            )
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, max_size=False)
 
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
@@ -233,6 +284,34 @@ def compile_gemm_fp8(
 
         # ---- LDS 分配 ----
         lds = fx.SharedAllocator().allocate(LDS).peek()
+
+        if const_expr(with_scale):
+            scale_async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+            scale_g2s_tv = fx.make_layout(((32, 8), 4), ((4, 128), 1))
+            scale_dma = fx.make_tiled_copy(
+                scale_async_copy_atom, scale_g2s_tv, fx.make_tile(128, 8)
+            ).get_slice(tid)
+            scale_lds_layout = fx.make_layout((128, 8), (1, 128))
+            scale_a_t_g = scale_dma.partition_S(ScaleA[(None, None), (bid_x * 2 + 0, None)])
+            scale_a_b_g = scale_dma.partition_S(ScaleA[(None, None), (bid_x * 2 + 1, None)])
+            scale_b_l_g = scale_dma.partition_S(ScaleB[(None, None), (bid_y * 2 + 0, None)])
+            scale_b_r_g = scale_dma.partition_S(ScaleB[(None, None), (bid_y * 2 + 1, None)])
+            scale_a_t_s = [
+                scale_dma.partition_D(fx.make_view(lds.scale_a_t0.ptr, scale_lds_layout)),
+                scale_dma.partition_D(fx.make_view(lds.scale_a_t1.ptr, scale_lds_layout)),
+            ]
+            scale_a_b_s = [
+                scale_dma.partition_D(fx.make_view(lds.scale_a_b0.ptr, scale_lds_layout)),
+                scale_dma.partition_D(fx.make_view(lds.scale_a_b1.ptr, scale_lds_layout)),
+            ]
+            scale_b_l_s = [
+                scale_dma.partition_D(fx.make_view(lds.scale_b_l0.ptr, scale_lds_layout)),
+                scale_dma.partition_D(fx.make_view(lds.scale_b_l1.ptr, scale_lds_layout)),
+            ]
+            scale_b_r_s = [
+                scale_dma.partition_D(fx.make_view(lds.scale_b_r0.ptr, scale_lds_layout)),
+                scale_dma.partition_D(fx.make_view(lds.scale_b_r1.ptr, scale_lds_layout)),
+            ]
 
         # wr/rd LDS 布局 + DMA tiled copy：swizzle 版（ordered wr + swizzle rd + make_layout_tv DMA）
         # 或 padding 版（分组 wr/rd + 专用 a_dma）。A/B 共用同一 dma。
@@ -338,17 +417,33 @@ def compile_gemm_fp8(
             ki = fx.Int32(kk)
             fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
             rocdl.sched_barrier(0)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, ki], scale_b_l_s[buf])
+                rocdl.sched_barrier(0)
+
             fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
             rocdl.sched_barrier(0)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, ki], scale_a_t_s[buf])
+                rocdl.sched_barrier(0)
+
             fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
             rocdl.sched_barrier(0)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, ki], scale_a_b_s[buf])
+                rocdl.sched_barrier(0)
+
             fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
             rocdl.sched_barrier(0)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, ki], scale_b_r_s[buf])
+                rocdl.sched_barrier(0)
+
+        vmcnt_per_phase = 5 if with_scale else 4
 
         do_g2s(0, 0)
         do_g2s(1, 1)
-
-        waitvmcnt_barrier(24)
+        waitvmcnt_barrier(vmcnt_per_phase * 6)
         fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
         fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
         rocdl.sched_barrier(0)
@@ -376,7 +471,6 @@ def compile_gemm_fp8(
         
         for kidx, states in range(0, num_tiles - 2, 2, init=acc_init):
         # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
-
             frag_C_tl.store(states[0])
             frag_C_tr.store(states[1])
             frag_C_bl.store(states[2])
@@ -385,60 +479,76 @@ def compile_gemm_fp8(
 
             # ---- k-tile = buf0：4 象限 ----
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            hot_loop_scheduler_mainloop(0, b_vmem, a_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, kiter + 2], scale_b_l_s[0])
+            hot_loop_scheduler_mainloop(0, b_vmem + int(with_scale), a_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            hot_loop_scheduler_mainloop(1, a_vmem, b_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, kiter + 2], scale_a_t_s[0])
+            hot_loop_scheduler_mainloop(1, a_vmem + int(with_scale), b_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            hot_loop_scheduler_mainloop(2, a_vmem, b_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, kiter + 2], scale_a_b_s[0])
+            hot_loop_scheduler_mainloop(2, a_vmem + int(with_scale), b_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
-            hot_loop_scheduler_mainloop(3, b_vmem, a_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, kiter + 2], scale_b_r_s[0])
+            hot_loop_scheduler_mainloop(3, b_vmem + int(with_scale), a_dsrd)
             rocdl.sched_barrier(0)
 
             # ---- k-tile = buf1：4 象限 ----
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            hot_loop_scheduler_mainloop(4, b_vmem, a_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, kiter + 3], scale_b_l_s[1])
+            hot_loop_scheduler_mainloop(4, b_vmem + int(with_scale), a_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            hot_loop_scheduler_mainloop(5, a_vmem, b_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, kiter + 3], scale_a_t_s[1])
+            hot_loop_scheduler_mainloop(5, a_vmem + int(with_scale), b_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            hot_loop_scheduler_mainloop(6, a_vmem, b_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, kiter + 3], scale_a_b_s[1])
+            hot_loop_scheduler_mainloop(6, a_vmem + int(with_scale), b_dsrd)
             rocdl.sched_barrier(0)
 
             fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
-            waitvmcnt_barrier(20)
+            waitvmcnt_barrier(vmcnt_per_phase * 5)
             fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
-            hot_loop_scheduler_mainloop(7, b_vmem, a_dsrd)
+            if const_expr(with_scale):
+                fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, kiter + 3], scale_b_r_s[1])
+            hot_loop_scheduler_mainloop(7, b_vmem + int(with_scale), a_dsrd)
             rocdl.sched_barrier(0)
 
             results = yield [frag_C_tl.load(), frag_C_tr.load(), frag_C_bl.load(), frag_C_br.load()]
@@ -449,25 +559,25 @@ def compile_gemm_fp8(
 
         # ---- epilogue：最后 2 个 k-tile（buf0 / buf1），无 g2s，只做 s2r + gemm ----
         # buf0 的 4 象限
-        waitvmcnt_barrier(20)
+        waitvmcnt_barrier(vmcnt_per_phase * 5)
         fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
         fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
         hot_loop_scheduler_mainloop(0, 0, 8)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(16)
+        waitvmcnt_barrier(vmcnt_per_phase * 4)
         fx.gemm(mma_atom, frag_C_bl, frag_B_l, frag_A_b, frag_C_bl)
         fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
         hot_loop_scheduler_mainloop(1, 0, 8)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(12)
+        waitvmcnt_barrier(vmcnt_per_phase * 3)
         fx.gemm(mma_atom, frag_C_tr, frag_B_r, frag_A_t, frag_C_tr)
         fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
         hot_loop_scheduler_mainloop(2, 0, 8)
         rocdl.sched_barrier(0)
 
-        waitvmcnt_barrier(8)
+        waitvmcnt_barrier(vmcnt_per_phase * 2)
         fx.gemm(mma_atom, frag_C_br, frag_B_r, frag_A_b, frag_C_br)
         fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
         hot_loop_scheduler_mainloop(3, 0, 8)
@@ -539,7 +649,7 @@ def compile_gemm_fp8(
         # 用 MFMA 计算掩盖 buffer_store 的写延迟（对标 bf16 v9 scheduler_store_overlap）；
         # 否则先算完 4 象限，再统一 store（不交织，用于对照）。
         if const_expr(store_overlap):
-            waitvmcnt_barrier(4)
+            waitvmcnt_barrier(vmcnt_per_phase * 1)
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             hot_loop_scheduler_mainloop(4, 0, 8)
@@ -568,7 +678,7 @@ def compile_gemm_fp8(
             # 最后 br 单独 store
             store_quadrant(frag_C_br, bC_br, 1, 1)
         else:
-            waitvmcnt_barrier(4)
+            waitvmcnt_barrier(vmcnt_per_phase)
             fx.gemm(mma_atom, frag_C_tl, frag_B_l, frag_A_t, frag_C_tl)
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             hot_loop_scheduler_mainloop(4, 0, 8)
@@ -593,14 +703,22 @@ def compile_gemm_fp8(
             store_quadrant(frag_C_br, bC_br, 1, 1)
 
     @flyc.jit
-    def launch_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
+    def launch_gemm(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        ScaleA: fx.Tensor,
+        ScaleB: fx.Tensor,
+        C: fx.Tensor,
+        M: int,
+        stream: fx.Stream = fx.Stream(None),
+    ):
         # 累加器钉到 AGPR（force-agpr）+ mfma-vgpr-form=False：避免 C 累加器 VGPR/AGPR 混放导致的
         # v_accvgpr 拷贝与 VGPR 压力（对标 test_gemm_v9.py）。
         value_attrs = {
             "rocdl.waves_per_eu": 1,
             "passthrough": [["amdgpu-agpr-alloc", "256,256"]],
         }
-        gemm_kernel(A, B, C, M, value_attrs=value_attrs).launch(
+        gemm_kernel(A, B, ScaleA, ScaleB, C, M, value_attrs=value_attrs).launch(
             grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -636,19 +754,34 @@ def _load_shuffle_weight():
 
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
-             run_count=50, data_clones=32):
+             with_scale=False, run_count=50, data_clones=32):
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
 
     def _shuffle_b(x):
         return shuffle_weight(x, layout=(16, 64)) if PRESHUFFLE_B else x
 
-    a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
-    b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+    def _permute_scale(scale):
+        rows, groups = scale.shape
+        return scale.view(rows // 128, 4, 32, groups).permute(3, 0, 2, 1).contiguous().view(-1)
+
+    def _random_fp8(shape):
+        return torch.randn(shape, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+
+    a = _random_fp8((M, K))
+    b = _random_fp8((N, K))
     ref = a.float() @ b.float().t()
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     weight = _shuffle_b(b)  # preshuffle 时喂 shuffle 后的 B；ref 仍用原始 b
+    scale_a = (
+        _permute_scale(torch.zeros((M, K // 32), device="cuda", dtype=torch.uint8))
+        if with_scale else torch.empty(1, device="cuda", dtype=torch.uint8)
+    )
+    scale_b = (
+        _permute_scale(torch.zeros((N, K // 32), device="cuda", dtype=torch.uint8))
+        if with_scale else torch.empty(1, device="cuda", dtype=torch.uint8)
+    )
     stream = torch.cuda.current_stream()
-    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1), M, stream)
+    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), scale_a, scale_b, out.view(-1), M, stream)
 
     launcher = compile_gemm_fp8(
         TILEM, TILEN, TILEK, N, K,
@@ -656,13 +789,15 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
         preshuffle_b=PRESHUFFLE_B,
         permlane_epilogue=permlane_output,
         store_overlap=store_overlap,
+        with_scale=with_scale,
     )
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     kernel(*args)
     torch.cuda.synchronize()
 
-    is_correct = torch.allclose(out.float(), ref, rtol=0.05, atol=0.5)
-    print(f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {is_correct=}")
+    is_correct = torch.allclose(out.float(), ref, rtol=0.02, atol=0.01)
+    diff = pyhip.calc_diff(out.float(), ref.to(torch.bfloat16), diff_thr=0.00001)
+    print(f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {is_correct=} {diff=}")
     if not is_correct:
         mism = (out.float() - ref).abs()
         print(f"  max_abs_err={mism.max().item():.3f}  mism_count={(mism>0.5).sum().item()}/{M*N}")
@@ -672,11 +807,21 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
 
     # ---- perf（多份数据轮转，排除 L2 cache 影响）----
     # 单份 A+B 只有几十 MB，反复喂同一份会常驻 L2 -> 高估 TFLOPS；轮转多份（远大于 L2）确保 cold data。
-    As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
-    Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
+    As = [_random_fp8((M, K)) for _ in range(data_clones)]
+    Bs = [_shuffle_b(_random_fp8((N, K))) for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
+    ScaleAs = [
+        _permute_scale(torch.zeros((M, K // 32), device="cuda", dtype=torch.uint8))
+        if with_scale else scale_a
+        for _ in range(data_clones)
+    ]
+    ScaleBs = [
+        _permute_scale(torch.zeros((N, K // 32), device="cuda", dtype=torch.uint8))
+        if with_scale else scale_b
+        for _ in range(data_clones)
+    ]
     arg_sets = [
-        (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), Cs[i].view(-1), M, stream)
+        (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), ScaleAs[i], ScaleBs[i], Cs[i].view(-1), M, stream)
         for i in range(data_clones)
     ]
 
@@ -699,7 +844,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     best_ms = latencies[0]
     tflops = flops / (best_ms * 1e-3) / 1e12
     bw_gbs = mem_bytes / (best_ms * 1e-3) / 1e9
-    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} ===")
+    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} {with_scale=} ===")
     print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
     return is_correct
 
